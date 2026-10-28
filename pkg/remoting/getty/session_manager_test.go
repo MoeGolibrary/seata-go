@@ -142,6 +142,60 @@ func TestSessionManagerUsesDialedAddressForHostNameServers(t *testing.T) {
 	assert.False(t, stillBound)
 }
 
+func TestSessionManagerSkipsPendingSessionUntilReady(t *testing.T) {
+	previousLoadBalance := loadbalance.GetLoadBalanceConfig()
+	loadbalance.InitLoadBalanceConfig(loadbalance.Config{Type: "RoundRobinLoadBalance"})
+	t.Cleanup(func() {
+		loadbalance.InitLoadBalanceConfig(previousLoadBalance)
+	})
+
+	ctrl := gomock.NewController(t)
+	manager := newTestSessionManager(nil)
+	manager.refreshServerList([]*discovery.ServiceInstance{
+		{Addr: "127.0.0.1", Port: 8091},
+		{Addr: "127.0.0.2", Port: 8092},
+	})
+
+	ready := mock.NewMockTestSession(ctrl)
+	ready.EXPECT().IsClosed().Return(false).AnyTimes()
+	ready.EXPECT().RemoteAddr().Return("127.0.0.1:8091").AnyTimes()
+	pending := mock.NewMockTestSession(ctrl)
+	pending.EXPECT().IsClosed().Return(false).AnyTimes()
+	pending.EXPECT().RemoteAddr().Return("127.0.0.2:8092").AnyTimes()
+
+	manager.registerSession(ready)
+	manager.registerPendingSession(pending)
+
+	// The TC closes a channel that sends a request before it is registered, so a
+	// session must not carry requests until its own registration has finished.
+	for i := 0; i < 4; i++ {
+		selected := manager.selectSession(message.GlobalBeginRequest{TransactionName: "tx"})
+		assert.Equal(t, getty.Session(ready), selected)
+	}
+	assert.ElementsMatch(t, []getty.Session{ready}, manager.readySessions())
+
+	manager.markSessionReady(pending)
+	assert.ElementsMatch(t, []getty.Session{ready, pending}, manager.readySessions())
+}
+
+func TestSessionManagerReleasesPendingSession(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	manager := newTestSessionManager(nil)
+	manager.refreshServerList([]*discovery.ServiceInstance{{Addr: "127.0.0.1", Port: 8091}})
+
+	session := mock.NewMockTestSession(ctrl)
+	session.EXPECT().IsClosed().Return(false).AnyTimes()
+	session.EXPECT().RemoteAddr().Return("127.0.0.1:8091").AnyTimes()
+	session.EXPECT().Close().Times(1)
+
+	manager.registerPendingSession(session)
+	manager.releaseSession(session)
+
+	_, stillPending := manager.pendingSessions.Load(session)
+	assert.False(t, stillPending)
+	assert.Equal(t, int32(0), atomic.LoadInt32(&manager.sessionSize))
+}
+
 func TestSessionManagerClosesStaleClientWhenAddressRemovedDuringStart(t *testing.T) {
 	started := make(chan string, 1)
 	resumeStart := make(chan struct{})

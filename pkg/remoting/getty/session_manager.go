@@ -55,7 +55,11 @@ type SessionManager struct {
 	// getty.Session -> server address the session was dialed for. The
 	// configured address may be a host name, while session.RemoteAddr() is
 	// always the resolved ip:port, so address checks must use the former.
-	sessionAddresses      sync.Map
+	sessionAddresses sync.Map
+	// getty.Session -> struct{} for sessions whose TM registration has not
+	// finished yet. The TC closes a channel that sends a request before it is
+	// registered, so such sessions are not selectable.
+	pendingSessions       sync.Map
 	allSessions           sync.Map
 	sessionSize           int32
 	gettyConf             *config.Config
@@ -391,12 +395,46 @@ func (g *SessionManager) selectableSessions() *sync.Map {
 			g.releaseSession(session)
 			return true
 		}
+		if _, pending := g.pendingSessions.Load(session); pending {
+			return true
+		}
 		if g.isServerAddressAvailable(g.sessionServerAddress(session)) {
 			sessions.Store(session, value)
 		}
 		return true
 	})
 	return sessions
+}
+
+// readySessions returns every session that can carry requests: open, bound to
+// an available server address and registered with its TC.
+func (g *SessionManager) readySessions() []getty.Session {
+	var sessions []getty.Session
+	g.selectableSessions().Range(func(key, _ interface{}) bool {
+		if session, ok := key.(getty.Session); ok {
+			sessions = append(sessions, session)
+		}
+		return true
+	})
+	return sessions
+}
+
+// waitReadySessions returns the ready sessions, waiting the same way as
+// selectSession when none is ready yet.
+func (g *SessionManager) waitReadySessions() []getty.Session {
+	sessions := g.readySessions()
+	if len(sessions) > 0 {
+		return sessions
+	}
+	ticker := time.NewTicker(time.Duration(checkAliveInternal) * time.Millisecond)
+	defer ticker.Stop()
+	for i := 0; i < maxCheckAliveRetry; i++ {
+		<-ticker.C
+		if sessions = g.readySessions(); len(sessions) > 0 {
+			return sessions
+		}
+	}
+	return nil
 }
 
 func (g *SessionManager) isServerAddressAvailable(address string) bool {
@@ -461,6 +499,7 @@ func (g *SessionManager) releaseSession(session getty.Session) {
 	}
 	address := g.sessionServerAddress(session)
 	defer g.sessionAddresses.Delete(session)
+	defer g.pendingSessions.Delete(session)
 	if _, loaded := g.allSessions.LoadAndDelete(session); !loaded {
 		return
 	}
@@ -488,6 +527,19 @@ func (g *SessionManager) registerSession(session getty.Session) {
 	sMap := m.(*sync.Map)
 	sMap.Store(session, true)
 	atomic.AddInt32(&g.sessionSize, 1)
+}
+
+// registerPendingSession registers a newly opened session that must not carry
+// requests until markSessionReady is called for it.
+func (g *SessionManager) registerPendingSession(session getty.Session) {
+	g.pendingSessions.Store(session, struct{}{})
+	g.registerSession(session)
+}
+
+// markSessionReady makes a session selectable once the TC has accepted its
+// registration.
+func (g *SessionManager) markSessionReady(session getty.Session) {
+	g.pendingSessions.Delete(session)
 }
 
 func selectableConnectionCount(connections *sync.Map) int {
