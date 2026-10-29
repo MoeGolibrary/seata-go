@@ -228,6 +228,167 @@ func TestSessionManagerClosesStaleClientWhenAddressRemovedDuringStart(t *testing
 	}
 }
 
+func TestSessionManagerReconnectsServerAfterLastSessionCloses(t *testing.T) {
+	started := make(chan string, 4)
+	closed := make(chan string, 4)
+	manager := newTestSessionManager(func(instance *discovery.ServiceInstance) closeableClient {
+		address := serverAddress(instance)
+		started <- address
+		return &fakeServerClient{address: address, closed: closed}
+	})
+	timers := &fakeTimers{}
+	manager.afterFunc = timers.afterFunc
+	manager.refreshServerList([]*discovery.ServiceInstance{
+		{Addr: "localhost", Port: 8091},
+		{Addr: "127.0.0.2", Port: 8092},
+	})
+	assert.ElementsMatch(t, []string{"localhost:8091", "127.0.0.2:8092"},
+		[]string{nextStartedServer(t, started), nextStartedServer(t, started)})
+
+	ctrl := gomock.NewController(t)
+	first := newOpenTestSession(ctrl, "127.0.0.1:8091")
+	second := newOpenTestSession(ctrl, "127.0.0.1:8091")
+	other := newOpenTestSession(ctrl, "127.0.0.2:8092")
+	// getty closed this session but has not reported it yet.
+	closing := mock.NewMockTestSession(ctrl)
+	closing.EXPECT().IsClosed().Return(true).AnyTimes()
+	closing.EXPECT().RemoteAddr().Return("127.0.0.1:8091").AnyTimes()
+	for _, session := range []getty.Session{first, second, closing} {
+		manager.bindSessionAddress(session, "localhost:8091")
+		manager.registerSession(session)
+	}
+	manager.registerSession(other)
+
+	// The address still has an open session, so nothing needs to redial.
+	manager.releaseSession(first)
+	assert.Empty(t, timers.scheduledDelays())
+
+	// getty does not redial a connection the server closed, which is what a TC
+	// restart looks like, so losing the last session must restart the client.
+	manager.releaseSession(second)
+	assert.Equal(t, []time.Duration{minReconnectDelay}, timers.scheduledDelays())
+	assert.Equal(t, 1, timers.runAll())
+	assert.Equal(t, "localhost:8091", nextClosedServer(t, closed))
+	assert.Equal(t, "localhost:8091", nextStartedServer(t, started))
+	assert.Empty(t, started)
+	assert.Empty(t, closed)
+}
+
+func TestSessionManagerSkipsReconnectWhenNoLongerNeeded(t *testing.T) {
+	started := make(chan string, 4)
+	manager := newTestSessionManager(func(instance *discovery.ServiceInstance) closeableClient {
+		started <- serverAddress(instance)
+		return &fakeServerClient{}
+	})
+	timers := &fakeTimers{}
+	manager.afterFunc = timers.afterFunc
+	manager.refreshServerList([]*discovery.ServiceInstance{
+		{Addr: "127.0.0.1", Port: 8091},
+		{Addr: "127.0.0.2", Port: 8092},
+	})
+	nextStartedServer(t, started)
+	nextStartedServer(t, started)
+
+	ctrl := gomock.NewController(t)
+	lost := newOpenTestSession(ctrl, "127.0.0.1:8091")
+	manager.registerSession(lost)
+	manager.releaseSession(lost)
+
+	// The address got a new session before the timer fired.
+	recovered := newOpenTestSession(ctrl, "127.0.0.1:8091")
+	manager.registerSession(recovered)
+	assert.Equal(t, 1, timers.runAll())
+
+	// The address was removed before the timer fired.
+	removed := newOpenTestSession(ctrl, "127.0.0.2:8092")
+	manager.registerSession(removed)
+	manager.releaseSession(removed)
+	manager.refreshServerList([]*discovery.ServiceInstance{{Addr: "127.0.0.1", Port: 8091}})
+	assert.Equal(t, 1, timers.runAll())
+
+	assert.Empty(t, started)
+	assert.Len(t, timers.scheduledDelays(), 2)
+}
+
+func TestSessionManagerDropsReconnectOfRemovedAddress(t *testing.T) {
+	started := make(chan string, 4)
+	closed := make(chan string, 4)
+	manager := newTestSessionManager(func(instance *discovery.ServiceInstance) closeableClient {
+		address := serverAddress(instance)
+		started <- address
+		return &fakeServerClient{address: address, closed: closed}
+	})
+	timers := &fakeTimers{}
+	manager.afterFunc = timers.afterFunc
+	servers := []*discovery.ServiceInstance{{Addr: "127.0.0.1", Port: 8091}}
+	manager.refreshServerList(servers)
+	nextStartedServer(t, started)
+	ctrl := gomock.NewController(t)
+
+	// Releasing the sessions of a removed address does not reconnect it.
+	removed := newOpenTestSession(ctrl, "127.0.0.1:8091")
+	manager.registerSession(removed)
+	manager.refreshServerList(nil)
+	assert.Equal(t, "127.0.0.1:8091", nextClosedServer(t, closed))
+	assert.Empty(t, timers.scheduledDelays())
+
+	// A reconnect scheduled before the address was removed and added again
+	// must leave the client created on re-adding alone.
+	manager.refreshServerList(servers)
+	nextStartedServer(t, started)
+	lost := newOpenTestSession(ctrl, "127.0.0.1:8091")
+	manager.registerSession(lost)
+	manager.releaseSession(lost)
+	manager.refreshServerList(nil)
+	assert.Equal(t, "127.0.0.1:8091", nextClosedServer(t, closed))
+	manager.refreshServerList(servers)
+	nextStartedServer(t, started)
+	assert.Equal(t, 1, timers.runAll())
+	assert.Empty(t, started)
+	assert.Empty(t, closed)
+}
+
+func TestSessionManagerBacksOffReconnects(t *testing.T) {
+	manager := newTestSessionManager(nil)
+	timers := &fakeTimers{}
+	manager.afterFunc = timers.afterFunc
+	manager.refreshServerList([]*discovery.ServiceInstance{{Addr: "127.0.0.1", Port: 8091}})
+	ctrl := gomock.NewController(t)
+	loseSession := func(ready bool) {
+		session := newOpenTestSession(ctrl, "127.0.0.1:8091")
+		manager.registerPendingSession(session)
+		if ready {
+			manager.markSessionReady(session)
+		}
+		manager.releaseSession(session)
+	}
+
+	// Sessions that close before they are ready back the delay off.
+	for i := 0; i < 8; i++ {
+		loseSession(false)
+		// A session lost while a reconnect is pending does not schedule another.
+		loseSession(false)
+		assert.Equal(t, 1, timers.runAll())
+	}
+	ms := time.Millisecond
+	assert.Equal(t, []time.Duration{
+		300 * ms, 600 * ms, 1200 * ms, 2400 * ms, 4800 * ms, 9600 * ms, 10 * time.Second, 10 * time.Second,
+	}, timers.scheduledDelays())
+
+	// A session that became ready resets it.
+	loseSession(true)
+	delays := timers.scheduledDelays()
+	assert.Equal(t, minReconnectDelay, delays[len(delays)-1])
+}
+
+func newOpenTestSession(ctrl *gomock.Controller, remoteAddr string) *mock.MockTestSession {
+	session := mock.NewMockTestSession(ctrl)
+	session.EXPECT().IsClosed().Return(false).AnyTimes()
+	session.EXPECT().RemoteAddr().Return(remoteAddr).AnyTimes()
+	session.EXPECT().Close().AnyTimes()
+	return session
+}
+
 func newTestSessionManager(startClient func(*discovery.ServiceInstance) closeableClient) *SessionManager {
 	if startClient == nil {
 		startClient = func(*discovery.ServiceInstance) closeableClient {
@@ -238,7 +399,42 @@ func newTestSessionManager(startClient func(*discovery.ServiceInstance) closeabl
 		gettyConf:   &config.Config{},
 		seataConfig: &config.SeataConfig{TxServiceGroup: "default_tx_group"},
 		startClient: startClient,
+		// Tests that cover reconnects install fakeTimers; the others drop them.
+		afterFunc: func(time.Duration, func()) {},
 	}
+}
+
+// fakeTimers records the functions SessionManager schedules so that a test can
+// check their delays and run them by hand.
+type fakeTimers struct {
+	mu     sync.Mutex
+	delays []time.Duration
+	funcs  []func()
+}
+
+func (f *fakeTimers) afterFunc(d time.Duration, fn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.delays = append(f.delays, d)
+	f.funcs = append(f.funcs, fn)
+}
+
+func (f *fakeTimers) scheduledDelays() []time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]time.Duration(nil), f.delays...)
+}
+
+// runAll runs the pending functions and returns how many ran.
+func (f *fakeTimers) runAll() int {
+	f.mu.Lock()
+	funcs := f.funcs
+	f.funcs = nil
+	f.mu.Unlock()
+	for _, fn := range funcs {
+		fn()
+	}
+	return len(funcs)
 }
 
 func nextStartedServer(t *testing.T, started <-chan string) string {
