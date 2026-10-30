@@ -110,6 +110,38 @@ func TestSessionManagerSelectSessionSkipsRemovedServerAddress(t *testing.T) {
 	}
 }
 
+func TestSessionManagerUsesDialedAddressForHostNameServers(t *testing.T) {
+	previousLoadBalance := loadbalance.GetLoadBalanceConfig()
+	loadbalance.InitLoadBalanceConfig(loadbalance.Config{Type: "RoundRobinLoadBalance"})
+	t.Cleanup(func() {
+		loadbalance.InitLoadBalanceConfig(previousLoadBalance)
+	})
+
+	ctrl := gomock.NewController(t)
+	manager := newTestSessionManager(nil)
+	manager.refreshServerList([]*discovery.ServiceInstance{{Addr: "localhost", Port: 8091}})
+
+	// A server configured by host name is dialed by name, but the session only
+	// knows the resolved ip:port, which never appears in the address snapshot.
+	session := mock.NewMockTestSession(ctrl)
+	session.EXPECT().IsClosed().Return(false).AnyTimes()
+	session.EXPECT().RemoteAddr().Return("127.0.0.1:8091").AnyTimes()
+
+	manager.bindSessionAddress(session, "localhost:8091")
+	manager.registerSession(session)
+
+	selected := manager.selectSession(message.GlobalBeginRequest{TransactionName: "tx"})
+	assert.Equal(t, getty.Session(session), selected)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&manager.sessionSize))
+
+	// Removing the host name from the server list must release its session.
+	session.EXPECT().Close().Times(1)
+	manager.refreshServerList(nil)
+	assert.Equal(t, int32(0), atomic.LoadInt32(&manager.sessionSize))
+	_, stillBound := manager.sessionAddresses.Load(session)
+	assert.False(t, stillBound)
+}
+
 func TestSessionManagerClosesStaleClientWhenAddressRemovedDuringStart(t *testing.T) {
 	started := make(chan string, 1)
 	resumeStart := make(chan struct{})

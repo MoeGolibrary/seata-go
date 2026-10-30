@@ -51,7 +51,11 @@ var (
 
 type SessionManager struct {
 	// serverAddress -> rpc_client.Session -> bool
-	serverSessions        sync.Map
+	serverSessions sync.Map
+	// getty.Session -> server address the session was dialed for. The
+	// configured address may be a host name, while session.RemoteAddr() is
+	// always the resolved ip:port, so address checks must use the former.
+	sessionAddresses      sync.Map
 	allSessions           sync.Map
 	sessionSize           int32
 	gettyConf             *config.Config
@@ -237,15 +241,37 @@ func (g *SessionManager) releaseServerClientEntry(address string, entry *serverC
 }
 
 func (g *SessionManager) startGettyClient(instance *discovery.ServiceInstance) getty.Client {
+	address := serverAddress(instance)
 	gettyClient := getty.NewTCPClient(
-		getty.WithServerAddress(serverAddress(instance)),
+		getty.WithServerAddress(address),
 		// todo if read c.gettyConf.ConnectionNum, will cause the connect to fail
 		getty.WithConnectionNumber(1),
 		getty.WithReconnectInterval(g.gettyConf.ReconnectInterval),
 		getty.WithClientTaskPool(gxsync.NewTaskPoolSimple(0)),
 	)
-	go gettyClient.RunEventLoop(g.newSession)
+	go gettyClient.RunEventLoop(func(session getty.Session) error {
+		if err := g.newSession(session); err != nil {
+			return err
+		}
+		g.bindSessionAddress(session, address)
+		return nil
+	})
 	return gettyClient
+}
+
+// bindSessionAddress records the server address a session was dialed for.
+func (g *SessionManager) bindSessionAddress(session getty.Session, address string) {
+	g.sessionAddresses.Store(session, address)
+}
+
+// sessionServerAddress returns the server address a session was dialed for.
+// Sessions that were not opened by one of this manager's server clients fall
+// back to their remote address.
+func (g *SessionManager) sessionServerAddress(session getty.Session) string {
+	if address, ok := g.sessionAddresses.Load(session); ok {
+		return address.(string)
+	}
+	return session.RemoteAddr()
 }
 
 func (g *SessionManager) releaseServerAddress(address string) {
@@ -365,7 +391,7 @@ func (g *SessionManager) selectableSessions() *sync.Map {
 			g.releaseSession(session)
 			return true
 		}
-		if g.isServerAddressAvailable(session.RemoteAddr()) {
+		if g.isServerAddressAvailable(g.sessionServerAddress(session)) {
 			sessions.Store(session, value)
 		}
 		return true
@@ -433,10 +459,12 @@ func (g *SessionManager) releaseSession(session getty.Session) {
 	if session == nil {
 		return
 	}
+	address := g.sessionServerAddress(session)
+	defer g.sessionAddresses.Delete(session)
 	if _, loaded := g.allSessions.LoadAndDelete(session); !loaded {
 		return
 	}
-	if m, ok := g.serverSessions.Load(session.RemoteAddr()); ok {
+	if m, ok := g.serverSessions.Load(address); ok {
 		sMap := m.(*sync.Map)
 		sMap.Delete(session)
 	}
@@ -447,15 +475,16 @@ func (g *SessionManager) releaseSession(session getty.Session) {
 }
 
 func (g *SessionManager) registerSession(session getty.Session) {
-	if !g.isServerAddressAvailable(session.RemoteAddr()) {
-		log.Warnf("skip session for removed server address: %s", session.RemoteAddr())
+	address := g.sessionServerAddress(session)
+	if !g.isServerAddressAvailable(address) {
+		log.Warnf("skip session for removed server address: %s", address)
 		session.Close()
 		return
 	}
 	if _, loaded := g.allSessions.LoadOrStore(session, true); loaded {
 		return
 	}
-	m, _ := g.serverSessions.LoadOrStore(session.RemoteAddr(), &sync.Map{})
+	m, _ := g.serverSessions.LoadOrStore(address, &sync.Map{})
 	sMap := m.(*sync.Map)
 	sMap.Store(session, true)
 	atomic.AddInt32(&g.sessionSize, 1)
