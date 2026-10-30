@@ -19,6 +19,7 @@ package getty
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	getty "github.com/apache/dubbo-getty"
@@ -56,26 +57,49 @@ func GetGettyClientHandlerInstance() *gettyClientHandler {
 
 func (g *gettyClientHandler) OnOpen(session getty.Session) error {
 	log.Infof("Open new getty session ")
-	sessionManager.registerSession(session)
-	seataConfig := sessionManager.seataConfig
+	// Each TC only accepts requests from channels registered with it, so the
+	// registration must go out on this session, and the session must not carry
+	// other requests until it is done.
+	sessionManager.registerPendingSession(session)
 	go func() {
-		request := message.RegisterTMRequest{AbstractIdentifyRequest: message.AbstractIdentifyRequest{
-			Version:                 constant.SeataVersion,
-			ApplicationId:           seataConfig.ApplicationID,
-			TransactionServiceGroup: seataConfig.TxServiceGroup,
-		}}
-		err := GetGettyRemotingClient().SendAsyncRequest(request)
-		if err != nil {
-			log.Errorf("OnOpen error: {%#v}", err.Error())
+		if err := registerTM(WithSession(context.Background(), session)); err != nil {
+			log.Errorf("register TM on session %s error: {%v}", session.Stat(), err)
 			sessionManager.releaseSession(session)
 			return
 		}
+		// Mark the session ready before re-registering RM resources, so a
+		// resource registered concurrently also reaches this session.
+		sessionManager.markSessionReady(session)
 		if err := remoting.RunSessionOpenHooks(); err != nil {
 			log.Errorf("register cached RM resources error: {%v}", err)
 			sessionManager.releaseSession(session)
 		}
 	}()
 
+	return nil
+}
+
+// registerTM registers the TM on the session bound to ctx and checks that the TC
+// accepted it.
+func registerTM(ctx context.Context) error {
+	seataConfig := sessionManager.seataConfig
+	request := message.RegisterTMRequest{AbstractIdentifyRequest: message.AbstractIdentifyRequest{
+		Version:                 constant.SeataVersion,
+		ApplicationId:           seataConfig.ApplicationID,
+		TransactionServiceGroup: seataConfig.TxServiceGroup,
+	}}
+	res, err := GetGettyRemotingClient().SendSyncRequestInContext(ctx, request)
+	if err != nil {
+		return err
+	}
+	response, ok := res.(message.RegisterTMResponse)
+	if !ok {
+		return fmt.Errorf("unexpected register TM response: %#v", res)
+	}
+	if !response.Identified {
+		return fmt.Errorf("register TM rejected: %s", response.Msg)
+	}
+	log.Infof("register TM success on session %s", SessionFromContext(ctx).Stat())
 	return nil
 }
 
@@ -90,7 +114,9 @@ func (g *gettyClientHandler) OnClose(session getty.Session) {
 }
 
 func (g *gettyClientHandler) OnMessage(session getty.Session, pkg interface{}) {
-	ctx := context.Background()
+	// Bind the session so that processors reply on the session the request
+	// arrived on.
+	ctx := WithSession(context.Background(), session)
 	log.Debug("received message: {%#v}", pkg)
 
 	rpcMessage, ok := pkg.(message.RpcMessage)

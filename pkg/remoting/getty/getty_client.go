@@ -18,9 +18,12 @@
 package getty
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 
+	getty "github.com/apache/dubbo-getty"
 	gxtime "github.com/dubbogo/gost/time"
 	"go.uber.org/atomic"
 
@@ -81,6 +84,80 @@ func (client *GettyRemotingClient) SendAsyncResponse(msgID int32, msg interface{
 		Body:       msg,
 	}
 	return client.gettyRemoting.SendAsync(rpcMessage, nil, nil)
+}
+
+type sessionContextKey struct{}
+
+// WithSession binds a session to ctx. Requests and responses sent with the
+// returned context go to that session instead of a load-balanced one.
+func WithSession(ctx context.Context, session getty.Session) context.Context {
+	return context.WithValue(ctx, sessionContextKey{}, session)
+}
+
+// SessionFromContext returns the session bound to ctx, or nil.
+func SessionFromContext(ctx context.Context) getty.Session {
+	if ctx == nil {
+		return nil
+	}
+	session, _ := ctx.Value(sessionContextKey{}).(getty.Session)
+	return session
+}
+
+// SendSyncRequestInContext sends a synchronous request on the session bound to
+// ctx. Without a bound session it behaves like SendSyncRequest.
+func (client *GettyRemotingClient) SendSyncRequestInContext(ctx context.Context, msg interface{}) (interface{}, error) {
+	rpcMessage := message.RpcMessage{
+		ID:         int32(client.idGenerator.Inc()),
+		Type:       message.RequestTypeRequestSync,
+		Codec:      byte(codec.CodecTypeSeata),
+		Compressor: 0,
+		Body:       msg,
+	}
+	return client.gettyRemoting.SendSync(rpcMessage, SessionFromContext(ctx), client.syncCallback)
+}
+
+// SendAsyncResponseInContext replies on the session bound to ctx, which must be
+// the session the request arrived on: the TC that sent the request is the only
+// one waiting for the response, and message ids are not unique across TC
+// nodes. Without a bound session it behaves like SendAsyncResponse.
+func (client *GettyRemotingClient) SendAsyncResponseInContext(ctx context.Context, msgID int32, msg interface{}) error {
+	rpcMessage := message.RpcMessage{
+		ID:         msgID,
+		Type:       message.RequestTypeResponse,
+		Codec:      byte(codec.CodecTypeSeata),
+		Compressor: 0,
+		Body:       msg,
+	}
+	return client.gettyRemoting.SendAsync(rpcMessage, SessionFromContext(ctx), nil)
+}
+
+// ForEachReadySession calls fn once for every ready session, with that session
+// bound to the context. It waits like a normal request when no session is ready
+// yet. A session whose call fails is released so that it reconnects and runs
+// its registration again; an error is returned only if no call succeeded.
+func (client *GettyRemotingClient) ForEachReadySession(fn func(ctx context.Context) error) error {
+	if sessionManager == nil {
+		return fmt.Errorf("session is closed")
+	}
+	sessions := sessionManager.waitReadySessions()
+	if len(sessions) == 0 {
+		return fmt.Errorf("no ready session")
+	}
+	var errs []error
+	succeeded := 0
+	for _, session := range sessions {
+		if err := fn(WithSession(context.Background(), session)); err != nil {
+			log.Errorf("request on session %s failed, release it: %v", session.Stat(), err)
+			sessionManager.releaseSession(session)
+			errs = append(errs, err)
+			continue
+		}
+		succeeded++
+	}
+	if succeeded == 0 {
+		return errors.Join(errs...)
+	}
+	return nil
 }
 
 func (client *GettyRemotingClient) SendSyncRequest(msg interface{}) (interface{}, error) {
