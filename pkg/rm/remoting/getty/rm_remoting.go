@@ -18,6 +18,7 @@
 package getty
 
 import (
+	"context"
 	"fmt"
 
 	"seata.apache.org/seata-go/v2/pkg/protocol/message"
@@ -110,18 +111,29 @@ func (r *GettyRMRemoting) RegisterResource(resource rm.Resource) error {
 		},
 		ResourceIds: resource.GetResourceId(),
 	}
-	res, err := getty.GetGettyRemotingClient().SendSyncRequest(req)
+	// The TC dispatches phase-two requests only over channels that registered the
+	// resource with it, so the resource must be registered on every session, one
+	// per TC node, not on a single load-balanced one.
+	err := getty.GetGettyRemotingClient().ForEachReadySession(func(ctx context.Context) error {
+		res, err := getty.GetGettyRemotingClient().SendSyncRequestInContext(ctx, req)
+		if err != nil {
+			return err
+		}
+		response, ok := res.(message.RegisterRMResponse)
+		if !ok {
+			return fmt.Errorf("unexpected register RM response: %#v", res)
+		}
+		if !isRegisterSuccess(response) {
+			r.onRegisterRMFailure(response)
+			return fmt.Errorf("register RM rejected: %s", response.Msg)
+		}
+		r.onRegisterRMSuccess(response)
+		return nil
+	})
 	if err != nil {
 		log.Errorf("RegisterResourceManager error: {%#v}", err.Error())
 		return err
 	}
-
-	if isRegisterSuccess(res) {
-		r.onRegisterRMSuccess(res.(message.RegisterRMResponse))
-	} else {
-		r.onRegisterRMFailure(res.(message.RegisterRMResponse))
-	}
-
 	return nil
 }
 
