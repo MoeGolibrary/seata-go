@@ -45,9 +45,10 @@ replace seata.apache.org/seata-go/v2 => github.com/MoeGolibrary/seata-go/v2 <版
 
 | # | 内容 | 状态 | 上游 issue / PR | 提交 |
 |-|-|-|-|-|
-| 0 | 标记包 `pkg/moego` 与本文件（只留在 fork，不提上游） | 已完成 | — | — |
-| 1 | TC 地址写 DNS 名时，连接建立后立即被关闭（"skip session for removed server address"）；改为按解析后的地址匹配 | 待实现 | 待提交 | — |
-| 2 | RM 只通过一条会话向 TC 注册资源，TC 多副本时其他节点下发二阶段报 "rm client is not connected"；改为在每条会话建立（含重连）时都注册 | 待实现 | 待提交 | — |
+| 0 | 标记包 `pkg/moego` 与本文件（只留在 fork，不提上游） | 已完成 | — | PR #1 (`a9e5c3a`) |
+| 1 | TC 地址写 DNS 名时，连接建立后立即被关闭（"skip session for removed server address"）；改为按拨号时记录的服务地址匹配 | 已完成 | 待提交 | PR #2 (`2fcca8f`) |
+| 2 | 多 TC 下的会话注册与二阶段回包：每条会话就绪前在自身连接上注册 TM、在每条就绪会话上注册 RM 资源，且二阶段回包原路写回收到请求的会话 | 已完成 | 待提交 | PR #3 (`49fd2f6`) |
+| 3 | TC 重启主动关闭连接（EOF）后 `dubbo-getty` 不重连；某个服务地址无活跃会话时按指数退避（300ms～10s）重建客户端连接 | 已完成 | 待提交 | PR #4 (`c722143`) |
 
 ## 发版流程
 

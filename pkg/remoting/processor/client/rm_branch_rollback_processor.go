@@ -151,7 +151,11 @@ func (f *rmBranchRollbackProcessor) handleGettyBranchRollback(ctx context.Contex
 			BranchStatus: result.status,
 		},
 	}
-	sendResponse := branchEndSendResponse(f.sendResponse, getty.GetGettyRemotingClient().SendAsyncResponse)
+	// Reply on the session the request arrived on: only that TC waits for the
+	// response, and message ids are not unique across TC nodes.
+	sendResponse := branchEndSendResponse(f.sendResponse, func(msgID int32, msg interface{}) error {
+		return getty.GetGettyRemotingClient().SendAsyncResponseInContext(ctx, msgID, msg)
+	})
 	sendErr := sendResponse(rpcMessage.ID, response)
 	if sendErr != nil {
 		log.Errorf("send branch rollback response error: xid %s, branchID %d: %v", xid, branchID, sendErr)

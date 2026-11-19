@@ -42,6 +42,8 @@ const (
 	checkAliveInternal     = 100
 	heartBeatRetryTimesKey = "heartbeat-retry-times"
 	maxHeartBeatRetryTimes = 3
+	minReconnectDelay      = 300 * time.Millisecond
+	maxReconnectDelay      = 10 * time.Second
 )
 
 var (
@@ -55,7 +57,11 @@ type SessionManager struct {
 	// getty.Session -> server address the session was dialed for. The
 	// configured address may be a host name, while session.RemoteAddr() is
 	// always the resolved ip:port, so address checks must use the former.
-	sessionAddresses      sync.Map
+	sessionAddresses sync.Map
+	// getty.Session -> struct{} for sessions whose TM registration has not
+	// finished yet. The TC closes a channel that sends a request before it is
+	// registered, so such sessions are not selectable.
+	pendingSessions       sync.Map
 	allSessions           sync.Map
 	sessionSize           int32
 	gettyConf             *config.Config
@@ -66,16 +72,27 @@ type SessionManager struct {
 	serverAddressSnapshot map[string]struct{}
 	serverAddressReady    bool
 	startClient           func(*discovery.ServiceInstance) closeableClient
+	// server address -> reconnect backoff of that address.
+	reconnectMu sync.Mutex
+	reconnects  map[string]*reconnectState
+	// afterFunc runs f after d; it defaults to time.AfterFunc.
+	afterFunc func(d time.Duration, f func())
 }
 
 type closeableClient interface {
 	Close()
 }
 
+type reconnectState struct {
+	scheduled bool
+	delay     time.Duration
+}
+
 type serverClientEntry struct {
-	mu     sync.Mutex
-	client closeableClient
-	closed bool
+	mu       sync.Mutex
+	instance *discovery.ServiceInstance
+	client   closeableClient
+	closed   bool
 }
 
 func (e *serverClientEntry) setClient(client closeableClient) bool {
@@ -207,7 +224,7 @@ func (g *SessionManager) replaceServerAddressSnapshot(servers map[string]*discov
 
 func (g *SessionManager) ensureServerClient(instance *discovery.ServiceInstance) {
 	address := serverAddress(instance)
-	entry := &serverClientEntry{}
+	entry := &serverClientEntry{instance: instance}
 	if _, loaded := g.serverClients.LoadOrStore(address, entry); loaded {
 		return
 	}
@@ -289,6 +306,111 @@ func (g *SessionManager) releaseServerAddress(address string) {
 			return true
 		})
 	}
+	g.reconnectMu.Lock()
+	delete(g.reconnects, address)
+	g.reconnectMu.Unlock()
+}
+
+// scheduleReconnect restarts the client of a server address once the address
+// has lost its last open session. getty does not redial a connection that the
+// server closed, which is exactly what a TC restart looks like, so without this
+// the address would stay unreachable until the process restarts. When getty
+// does redial, its new session is open by the time the old one is released,
+// and nothing is scheduled. The delay backs off while restarted clients keep
+// losing their sessions before they are ready, and resets once one is ready.
+func (g *SessionManager) scheduleReconnect(address string) {
+	if !g.isServerAddressAvailable(address) || g.hasOpenSession(address) {
+		return
+	}
+	g.reconnectMu.Lock()
+	if g.reconnects == nil {
+		g.reconnects = make(map[string]*reconnectState)
+	}
+	state, ok := g.reconnects[address]
+	if !ok {
+		state = &reconnectState{delay: minReconnectDelay}
+		g.reconnects[address] = state
+	}
+	if state.scheduled {
+		g.reconnectMu.Unlock()
+		return
+	}
+	state.scheduled = true
+	delay := state.delay
+	state.delay *= 2
+	if state.delay > maxReconnectDelay {
+		state.delay = maxReconnectDelay
+	}
+	g.reconnectMu.Unlock()
+
+	log.Infof("server %s has no open session, reconnect in %v", address, delay)
+	g.after(delay, func() {
+		g.reconnectMu.Lock()
+		state.scheduled = false
+		// The address was removed after this was scheduled. If it was added
+		// again, its new client is not this reconnect's business.
+		current := g.reconnects[address] == state
+		g.reconnectMu.Unlock()
+		if current {
+			g.reconnect(address)
+		}
+	})
+}
+
+// reconnect replaces the client of address with a new one, unless the address
+// was removed or got an open session in the meantime. The new client keeps
+// dialing until the server accepts.
+//
+// If getty is still redialing in the old client, a session it dials just before
+// the close is run but not kept by that client. The manager still tracks it and
+// releases it like any other session.
+func (g *SessionManager) reconnect(address string) {
+	if !g.isServerAddressAvailable(address) || g.hasOpenSession(address) {
+		return
+	}
+	entryAny, ok := g.serverClients.Load(address)
+	if !ok {
+		return
+	}
+	entry := entryAny.(*serverClientEntry)
+	g.releaseServerClientEntry(address, entry)
+	log.Infof("restart client of server %s", address)
+	g.ensureServerClient(entry.instance)
+}
+
+// resetReconnectDelay is called when a session of address becomes ready.
+func (g *SessionManager) resetReconnectDelay(address string) {
+	g.reconnectMu.Lock()
+	if state, ok := g.reconnects[address]; ok {
+		state.delay = minReconnectDelay
+	}
+	g.reconnectMu.Unlock()
+}
+
+// hasOpenSession reports whether address has a session that is still open,
+// whether or not its registration has finished.
+func (g *SessionManager) hasOpenSession(address string) bool {
+	sessionsAny, ok := g.serverSessions.Load(address)
+	if !ok {
+		return false
+	}
+	open := false
+	sessionsAny.(*sync.Map).Range(func(key, _ interface{}) bool {
+		if session, ok := key.(getty.Session); ok && !session.IsClosed() {
+			open = true
+			return false
+		}
+		return true
+	})
+	return open
+}
+
+func (g *SessionManager) after(d time.Duration, f func()) {
+	if g.afterFunc != nil {
+		g.afterFunc(d, f)
+		return
+	}
+	time.AfterFunc(d, f)
 }
 
 func serverAddress(instance *discovery.ServiceInstance) string {
@@ -391,12 +513,46 @@ func (g *SessionManager) selectableSessions() *sync.Map {
 			g.releaseSession(session)
 			return true
 		}
+		if _, pending := g.pendingSessions.Load(session); pending {
+			return true
+		}
 		if g.isServerAddressAvailable(g.sessionServerAddress(session)) {
 			sessions.Store(session, value)
 		}
 		return true
 	})
 	return sessions
+}
+
+// readySessions returns every session that can carry requests: open, bound to
+// an available server address and registered with its TC.
+func (g *SessionManager) readySessions() []getty.Session {
+	var sessions []getty.Session
+	g.selectableSessions().Range(func(key, _ interface{}) bool {
+		if session, ok := key.(getty.Session); ok {
+			sessions = append(sessions, session)
+		}
+		return true
+	})
+	return sessions
+}
+
+// waitReadySessions returns the ready sessions, waiting the same way as
+// selectSession when none is ready yet.
+func (g *SessionManager) waitReadySessions() []getty.Session {
+	sessions := g.readySessions()
+	if len(sessions) > 0 {
+		return sessions
+	}
+	ticker := time.NewTicker(time.Duration(checkAliveInternal) * time.Millisecond)
+	defer ticker.Stop()
+	for i := 0; i < maxCheckAliveRetry; i++ {
+		<-ticker.C
+		if sessions = g.readySessions(); len(sessions) > 0 {
+			return sessions
+		}
+	}
+	return nil
 }
 
 func (g *SessionManager) isServerAddressAvailable(address string) bool {
@@ -461,6 +617,7 @@ func (g *SessionManager) releaseSession(session getty.Session) {
 	}
 	address := g.sessionServerAddress(session)
 	defer g.sessionAddresses.Delete(session)
+	defer g.pendingSessions.Delete(session)
 	if _, loaded := g.allSessions.LoadAndDelete(session); !loaded {
 		return
 	}
@@ -472,6 +629,7 @@ func (g *SessionManager) releaseSession(session getty.Session) {
 		session.Close()
 	}
 	atomic.AddInt32(&g.sessionSize, -1)
+	g.scheduleReconnect(address)
 }
 
 func (g *SessionManager) registerSession(session getty.Session) {
@@ -488,6 +646,20 @@ func (g *SessionManager) registerSession(session getty.Session) {
 	sMap := m.(*sync.Map)
 	sMap.Store(session, true)
 	atomic.AddInt32(&g.sessionSize, 1)
+}
+
+// registerPendingSession registers a newly opened session that must not carry
+// requests until markSessionReady is called for it.
+func (g *SessionManager) registerPendingSession(session getty.Session) {
+	g.pendingSessions.Store(session, struct{}{})
+	g.registerSession(session)
+}
+
+// markSessionReady makes a session selectable once the TC has accepted its
+// registration.
+func (g *SessionManager) markSessionReady(session getty.Session) {
+	g.pendingSessions.Delete(session)
+	g.resetReconnectDelay(g.sessionServerAddress(session))
 }
 
 func selectableConnectionCount(connections *sync.Map) int {
