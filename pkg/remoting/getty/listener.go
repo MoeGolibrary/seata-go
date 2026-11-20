@@ -110,7 +110,15 @@ func (g *gettyClientHandler) OnError(session getty.Session, err error) {
 
 func (g *gettyClientHandler) OnClose(session getty.Session) {
 	log.Infof("session{%s} is closing......", session.Stat())
-	sessionManager.releaseSession(session)
+	if sessionManager != nil {
+		sessionManager.releaseSession(session)
+	}
+	if session != nil && !session.IsClosed() {
+		session.Close()
+	}
+	// Block OnClose from returning into dubbo-getty's session.gc() (which nils s.Connection)
+	// until any in-flight WritePkg finishes, and mark the session closed under the same lock.
+	closeSessionWriter(session)
 }
 
 func (g *gettyClientHandler) OnMessage(session getty.Session, pkg interface{}) {

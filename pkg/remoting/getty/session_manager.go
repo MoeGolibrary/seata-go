@@ -18,6 +18,7 @@
 package getty
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -424,6 +425,7 @@ func (g *SessionManager) setSessionConfig(session getty.Session) {
 	session.SetEventListener(GetGettyClientHandlerInstance())
 	session.SetReadTimeout(g.gettyConf.SessionConfig.TCPReadTimeout)
 	session.SetWriteTimeout(g.gettyConf.SessionConfig.TCPWriteTimeout)
+	registerSessionWriter(session, g.gettyConf.SessionConfig.TCPWriteTimeout)
 	session.SetCronPeriod((int)(g.gettyConf.SessionConfig.CronPeriod.Milliseconds()))
 	session.SetWaitTime(g.gettyConf.SessionConfig.WaitTimeout)
 	session.SetAttribute(heartBeatRetryTimesKey, 0)
@@ -500,6 +502,41 @@ func (g *SessionManager) selectSession(msg interface{}) getty.Session {
 		}
 	}
 	return nil
+}
+
+func (g *SessionManager) selectSessionWithContext(ctx context.Context, msg interface{}) (getty.Session, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	sessions := g.selectableSessions()
+	selected := loadbalance.Select(loadbalance.GetLoadBalanceConfig().Type, sessions, g.getXid(msg))
+	if session, ok := selected.(getty.Session); ok && session != nil {
+		return session, nil
+	}
+
+	if selectableConnectionCount(sessions) == 0 {
+		ticker := time.NewTicker(time.Duration(checkAliveInternal) * time.Millisecond)
+		defer ticker.Stop()
+		for i := 0; i < maxCheckAliveRetry; i++ {
+			if ctx != nil && ctx.Done() != nil {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-ticker.C:
+				}
+			} else {
+				<-ticker.C
+			}
+			sessions = g.selectableSessions()
+			selected = loadbalance.Select(loadbalance.GetLoadBalanceConfig().Type, sessions, g.getXid(msg))
+			if session, ok := selected.(getty.Session); ok && session != nil {
+				return session, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("session is closed")
 }
 
 func (g *SessionManager) selectableSessions() *sync.Map {

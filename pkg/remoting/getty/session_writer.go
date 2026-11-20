@@ -1,0 +1,182 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package getty
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	getty "github.com/apache/dubbo-getty"
+
+	"seata.apache.org/seata-go/v2/pkg/protocol/message"
+)
+
+const defaultSessionWriteTimeout = 5 * time.Second
+
+var (
+	errSessionClosedSentinel = errors.New("session is closed")
+	sessionWriters           sync.Map // map[getty.Session]*sessionWriter
+)
+
+type sessionWriter struct {
+	sem            chan struct{}
+	closed         bool
+	defaultTimeout time.Duration
+	remoteAddr     string
+}
+
+func newSessionWriter(defaultTimeout time.Duration, remoteAddr string) *sessionWriter {
+	if defaultTimeout <= 0 {
+		defaultTimeout = defaultSessionWriteTimeout
+	}
+	return &sessionWriter{
+		sem:            make(chan struct{}, 1),
+		defaultTimeout: defaultTimeout,
+		remoteAddr:     remoteAddr,
+	}
+}
+
+func registerSessionWriter(session getty.Session, defaultTimeout time.Duration) {
+	if session == nil {
+		return
+	}
+	sessionWriters.Store(session, newSessionWriter(defaultTimeout, session.RemoteAddr()))
+}
+
+func getOrCreateSessionWriter(session getty.Session) *sessionWriter {
+	if existing, ok := sessionWriters.Load(session); ok {
+		return existing.(*sessionWriter)
+	}
+	created := newSessionWriter(defaultSessionWriteTimeout, "")
+	actual, _ := sessionWriters.LoadOrStore(session, created)
+	return actual.(*sessionWriter)
+}
+
+// closeSessionWriter serializes session teardown with in-flight WritePkg calls
+// inside OnClose, right before dubbo-getty's session.gc() sets s.Connection = nil.
+func closeSessionWriter(session getty.Session) {
+	if session == nil {
+		return
+	}
+	w := getOrCreateSessionWriter(session)
+	w.sem <- struct{}{}
+	w.closed = true
+	<-w.sem
+	sessionWriters.CompareAndDelete(session, w)
+}
+
+func writeSessionPkg(
+	ctx context.Context,
+	session getty.Session,
+	msg message.RpcMessage,
+	capturePeerAddr bool,
+	onReadyToSend func(peerAddr string),
+	closeOnWriteErr bool,
+) (peerAddr string, writeFailed bool, err error) {
+	if session == nil {
+		return "", false, fmt.Errorf("session is closed")
+	}
+	if ctx != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", false, ctxErr
+		}
+	}
+
+	w := getOrCreateSessionWriter(session)
+	if ctx != nil && ctx.Done() != nil {
+		select {
+		case <-ctx.Done():
+			return "", false, ctx.Err()
+		case w.sem <- struct{}{}:
+		}
+	} else {
+		w.sem <- struct{}{}
+	}
+
+	needRelease := false
+	defer func() {
+		<-w.sem
+		if needRelease {
+			releaseBrokenSession(session, w, closeOnWriteErr)
+		}
+	}()
+
+	if w.closed || session.IsClosed() {
+		if session.IsClosed() {
+			sessionWriters.CompareAndDelete(session, w)
+		}
+		return "", false, errSessionClosedSentinel
+	}
+
+	writeTimeout := w.defaultTimeout
+	if writeTimeout <= 0 {
+		writeTimeout = defaultSessionWriteTimeout
+	}
+	if ctx != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", false, ctxErr
+		}
+		if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+			rem := time.Until(deadline)
+			if rem <= 0 {
+				return "", false, context.DeadlineExceeded
+			}
+			if rem < writeTimeout {
+				writeTimeout = rem
+			}
+		}
+	}
+
+	if capturePeerAddr {
+		if w.remoteAddr == "" {
+			w.remoteAddr = session.RemoteAddr()
+		}
+		peerAddr = w.remoteAddr
+	}
+	if onReadyToSend != nil {
+		onReadyToSend(peerAddr)
+	}
+
+	_, _, writeErr := session.WritePkg(msg, writeTimeout)
+	if writeErr != nil {
+		w.closed = true
+		needRelease = true
+		if ctx != nil && ctx.Err() != nil {
+			return peerAddr, true, ctx.Err()
+		}
+		return peerAddr, true, writeErr
+	}
+	return peerAddr, false, nil
+}
+
+func releaseBrokenSession(session getty.Session, w *sessionWriter, closeOnWriteErr bool) {
+	if sessionManager != nil {
+		if _, registered := sessionManager.allSessions.Load(session); registered {
+			sessionManager.releaseSession(session)
+			sessionWriters.CompareAndDelete(session, w)
+			return
+		}
+	}
+	if closeOnWriteErr && !session.IsClosed() {
+		session.Close()
+		sessionWriters.CompareAndDelete(session, w)
+	}
+}
