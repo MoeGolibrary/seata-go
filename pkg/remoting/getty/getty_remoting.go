@@ -18,6 +18,8 @@
 package getty
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -63,11 +65,42 @@ func (g *GettyRemoting) SendSync(msg message.RpcMessage, s getty.Session, callba
 		log.Warn("sendAsyncRequestWithResponse nothing, caused by null channel.")
 		return nil, fmt.Errorf("session is closed")
 	}
-	rpc.BeginCount(s.RemoteAddr())
-	result, err := g.sendAsync(s, msg, callback)
-	rpc.EndCount(s.RemoteAddr())
+	result, addr, err := g.sendAsyncWithContext(context.Background(), s, msg, callback, true, false)
 	if err != nil {
-		log.Errorf("send message: %#v, session: %s", msg, s.Stat())
+		log.Errorf("send message: %#v, peer: %s, err: %v", msg, addr, err)
+		return nil, err
+	}
+	return result, nil
+}
+
+func (g *GettyRemoting) SendSyncWithContext(
+	ctx context.Context,
+	msg message.RpcMessage,
+	s getty.Session,
+	callback callbackMethod,
+) (interface{}, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	if s == nil {
+		if sessionManager == nil {
+			return nil, fmt.Errorf("session is closed")
+		}
+		var selErr error
+		s, selErr = sessionManager.selectSessionWithContext(ctx, msg.Body)
+		if selErr != nil {
+			return nil, selErr
+		}
+	}
+	if s == nil || s.IsClosed() {
+		log.Warn("sendAsyncRequestWithResponse nothing, caused by null channel.")
+		return nil, fmt.Errorf("session is closed")
+	}
+	result, addr, err := g.sendAsyncWithContext(ctx, s, msg, callback, true, true)
+	if err != nil {
+		log.Errorf("send message: %#v, peer: %s, err: %v", msg, addr, err)
 		return nil, err
 	}
 	return result, nil
@@ -84,45 +117,75 @@ func (g *GettyRemoting) SendAsync(msg message.RpcMessage, s getty.Session, callb
 		log.Warn("sendAsyncRequestWithResponse nothing, caused by null channel.")
 		return fmt.Errorf("session is closed")
 	}
-	rpc.BeginCount(s.RemoteAddr())
-	_, err := g.sendAsync(s, msg, callback)
-	rpc.EndCount(s.RemoteAddr())
+	_, addr, err := g.sendAsyncWithContext(context.Background(), s, msg, callback, true, false)
 	if err != nil {
-		log.Errorf("send message: %#v, session: %s", msg, s.Stat())
+		log.Errorf("send message: %#v, peer: %s, err: %v", msg, addr, err)
 	}
 	return err
 }
 
 func (g *GettyRemoting) sendAsync(session getty.Session, msg message.RpcMessage, callback callbackMethod) (interface{}, error) {
+	res, _, err := g.sendAsyncWithContext(context.Background(), session, msg, callback, false, false)
+	return res, err
+}
+
+func (g *GettyRemoting) sendAsyncWithContext(
+	ctx context.Context,
+	session getty.Session,
+	msg message.RpcMessage,
+	callback callbackMethod,
+	trackRPCCount bool,
+	closeOnWriteErr bool,
+) (interface{}, string, error) {
 	if _, ok := msg.Body.(message.HeartBeatMessage); ok {
 		log.Debug("send async message: {%#v}", msg)
 	} else {
 		log.Infof("send async message: {%#v}", msg)
 	}
-	var err error
-	if session == nil || session.IsClosed() {
+	if session == nil {
 		log.Warn("sendAsyncRequestWithResponse nothing, caused by null channel.")
-		return nil, fmt.Errorf("session is closed")
+		return nil, "", fmt.Errorf("session is closed")
 	}
-	// Only requests with a callback wait for a response. A callback-less response
-	// may reuse the ID of an in-flight request, so it must not touch futures.
+	// Only requests with a callback wait for a response, and we register the future
+	// and read RemoteAddr only after acquiring the per-session write slot while !closed.
 	var resp *message.MessageFuture
-	if callback != nil {
-		resp = message.NewMessageFuture(msg)
-		g.futures.Store(msg.ID, resp)
-	}
-	_, _, err = session.WritePkg(msg, time.Duration(0))
+	counted := false
+	var countedAddr string
+	defer func() {
+		if counted {
+			rpc.EndCount(countedAddr)
+		}
+	}()
+
+	peerAddr, writeFailed, err := writeSessionPkg(ctx, session, msg, trackRPCCount, func(addr string) {
+		if trackRPCCount {
+			counted = true
+			countedAddr = addr
+			rpc.BeginCount(addr)
+		}
+		if callback != nil {
+			resp = message.NewMessageFuture(msg)
+			g.futures.Store(msg.ID, resp)
+		}
+	}, closeOnWriteErr)
 	if err != nil {
 		if resp != nil {
 			g.futures.Delete(msg.ID)
 		}
-		log.Errorf("send message: %#v, session: %s", msg, session.Stat())
-		return nil, err
+		if errors.Is(err, errSessionClosedSentinel) {
+			log.Warn("sendAsyncRequestWithResponse nothing, caused by null channel.")
+			return nil, peerAddr, fmt.Errorf("session is closed")
+		}
+		if writeFailed && !closeOnWriteErr {
+			log.Errorf("send message: %#v, session: %s", msg, session.Stat())
+		}
+		return nil, peerAddr, err
 	}
 	if callback != nil {
-		return callback(msg, resp)
+		res, cbErr := callback(msg, resp)
+		return res, peerAddr, cbErr
 	}
-	return nil, nil
+	return nil, peerAddr, nil
 }
 
 func (g *GettyRemoting) GetMessageFuture(msgID int32) *message.MessageFuture {

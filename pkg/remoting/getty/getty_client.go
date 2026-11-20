@@ -104,7 +104,9 @@ func SessionFromContext(ctx context.Context) getty.Session {
 }
 
 // SendSyncRequestInContext sends a synchronous request on the session bound to
-// ctx. Without a bound session it behaves like SendSyncRequest.
+// ctx. When ctx carries cancellation or a deadline, session selection, per-session
+// write lock acquisition, socket write deadline, and response wait all honor ctx.
+// Without a bound session it selects a ready session via load balancing.
 func (client *GettyRemotingClient) SendSyncRequestInContext(ctx context.Context, msg interface{}) (interface{}, error) {
 	rpcMessage := message.RpcMessage{
 		ID:         int32(client.idGenerator.Inc()),
@@ -113,7 +115,24 @@ func (client *GettyRemotingClient) SendSyncRequestInContext(ctx context.Context,
 		Compressor: 0,
 		Body:       msg,
 	}
-	return client.gettyRemoting.SendSync(rpcMessage, SessionFromContext(ctx), client.syncCallback)
+	if ctx == nil || ctx.Done() == nil {
+		return client.gettyRemoting.SendSync(rpcMessage, SessionFromContext(ctx), client.syncCallback)
+	}
+	return client.gettyRemoting.SendSyncWithContext(
+		ctx,
+		rpcMessage,
+		SessionFromContext(ctx),
+		client.syncCallbackWithContext(ctx),
+	)
+}
+
+// ReadySessions returns a non-blocking snapshot of all currently ready sessions
+// (open, bound to an available server address, and registered with TC).
+func (client *GettyRemotingClient) ReadySessions() []getty.Session {
+	if sessionManager == nil {
+		return nil
+	}
+	return sessionManager.readySessions()
 }
 
 // SendAsyncResponseInContext replies on the session bound to ctx, which must be
@@ -187,6 +206,26 @@ func (g *GettyRemotingClient) syncCallback(reqMsg message.RpcMessage, respMsg *m
 		return nil, fmt.Errorf("wait response timeout, request: %#v", reqMsg)
 	case <-respMsg.Done:
 		return respMsg.Response, respMsg.Err
+	}
+}
+
+func (g *GettyRemotingClient) syncCallbackWithContext(ctx context.Context) callbackMethod {
+	return func(reqMsg message.RpcMessage, respMsg *message.MessageFuture) (interface{}, error) {
+		defer g.gettyRemoting.RemoveMessageFuture(reqMsg.ID)
+		select {
+		case <-respMsg.Done:
+			return respMsg.Response, respMsg.Err
+		default:
+		}
+		select {
+		case <-respMsg.Done:
+			return respMsg.Response, respMsg.Err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-gxtime.GetDefaultTimerWheel().After(rpcRequestTimeout):
+			log.Errorf("wait resp timeout: %#v", reqMsg)
+			return nil, fmt.Errorf("wait response timeout, request: %#v", reqMsg)
+		}
 	}
 }
 
