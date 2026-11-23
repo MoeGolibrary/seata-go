@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -155,6 +156,7 @@ func writeSessionPkg(
 		onReadyToSend(peerAddr)
 	}
 
+	netConn := safeSessionConn(session)
 	var (
 		inWriteMu sync.Mutex
 		inWrite   = true
@@ -167,11 +169,11 @@ func writeSessionPkg(
 			if !inWrite {
 				return
 			}
-			abortInFlightSessionWrite(session)
+			abortInFlightSessionWrite(session, netConn)
 		})
 	}
 
-	_, _, writeErr := session.WritePkg(msg, writeTimeout)
+	writeErr := sendSessionFrame(session, netConn, msg, writeTimeout)
 	if stopAbort != nil {
 		stopAbort()
 	}
@@ -190,13 +192,49 @@ func writeSessionPkg(
 	return peerAddr, false, nil
 }
 
-func abortInFlightSessionWrite(session getty.Session) {
-	func() {
-		defer func() { _ = recover() }()
-		if conn := session.Conn(); conn != nil {
-			_ = conn.SetWriteDeadline(time.Now())
+func sendSessionFrame(
+	session getty.Session,
+	netConn net.Conn,
+	msg message.RpcMessage,
+	writeTimeout time.Duration,
+) (err error) {
+	if netConn != nil {
+		pkgBytes, encErr := rpcPkgHandler.Write(session, msg)
+		if encErr != nil {
+			return encErr
+		}
+		if writeTimeout > 0 {
+			if dlErr := netConn.SetWriteDeadline(time.Now().Add(writeTimeout)); dlErr != nil {
+				return dlErr
+			}
+		}
+		_, sendErr := netConn.Write(pkgBytes)
+		return sendErr
+	}
+	_, _, err = session.WritePkg(msg, writeTimeout)
+	return err
+}
+
+func safeSessionConn(session getty.Session) (conn net.Conn) {
+	defer func() {
+		if recover() != nil {
+			conn = nil
 		}
 	}()
+	if session == nil {
+		return nil
+	}
+	return session.Conn()
+}
+
+func abortInFlightSessionWrite(session getty.Session, netConn net.Conn) {
+	if netConn != nil {
+		// Directly expire the write deadline on the underlying net.Conn so an in-flight
+		// netConn.Write unblocks immediately without invoking dubbo-getty's session.stop()
+		// (which would reset SetWriteDeadline(now + s.WriteTimeout()) and race on gettyConn).
+		_ = netConn.SetWriteDeadline(time.Unix(1, 0))
+		return
+	}
 	defer func() { _ = recover() }()
 	if !session.IsClosed() {
 		session.Close()
@@ -204,6 +242,11 @@ func abortInFlightSessionWrite(session getty.Session) {
 }
 
 func releaseBrokenSession(session getty.Session, w *sessionWriter, closeOnWriteErr bool) {
+	defer func() {
+		if conn := safeSessionConn(session); conn != nil {
+			_ = conn.SetWriteDeadline(time.Unix(1, 0))
+		}
+	}()
 	if sessionManager != nil {
 		if _, registered := sessionManager.allSessions.Load(session); registered {
 			sessionManager.releaseSession(session)

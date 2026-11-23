@@ -19,6 +19,9 @@ package getty
 
 import (
 	"context"
+	"fmt"
+	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -28,7 +31,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"seata.apache.org/seata-go/v2/pkg/protocol/codec"
 	"seata.apache.org/seata-go/v2/pkg/protocol/message"
+	"seata.apache.org/seata-go/v2/pkg/util/log"
 )
 
 type gcAwareTestSession struct {
@@ -335,4 +340,251 @@ func TestSessionWriterInFlightWriteAbortsOnContextCancelAndRedactsApplicationDat
 	assert.Contains(t, summary, "order-v2.Create")
 	assert.NotContains(t, summary, "SECRET-ORDER-999")
 	assert.NotContains(t, summary, "actionContext")
+}
+
+type capturingTestLogger struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *capturingTestLogger) record(msg string) {
+	l.mu.Lock()
+	l.lines = append(l.lines, msg)
+	l.mu.Unlock()
+}
+
+func (l *capturingTestLogger) joined() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.lines, "\n")
+}
+
+func (l *capturingTestLogger) Debug(v ...any)                 { l.record(fmt.Sprint(v...)) }
+func (l *capturingTestLogger) Debugf(f string, v ...any)      { l.record(fmt.Sprintf(f, v...)) }
+func (l *capturingTestLogger) Info(v ...any)                  { l.record(fmt.Sprint(v...)) }
+func (l *capturingTestLogger) Infof(f string, v ...any)       { l.record(fmt.Sprintf(f, v...)) }
+func (l *capturingTestLogger) Warn(v ...any)                  { l.record(fmt.Sprint(v...)) }
+func (l *capturingTestLogger) Warnf(f string, v ...any)       { l.record(fmt.Sprintf(f, v...)) }
+func (l *capturingTestLogger) Error(v ...any)                 { l.record(fmt.Sprint(v...)) }
+func (l *capturingTestLogger) Errorf(f string, v ...any)      { l.record(fmt.Sprintf(f, v...)) }
+func (l *capturingTestLogger) Panic(v ...any)                 { l.record(fmt.Sprint(v...)) }
+func (l *capturingTestLogger) Panicf(f string, v ...any)      { l.record(fmt.Sprintf(f, v...)) }
+func (l *capturingTestLogger) Fatal(v ...any)                 { l.record(fmt.Sprint(v...)) }
+func (l *capturingTestLogger) Fatalf(f string, v ...any)      { l.record(fmt.Sprintf(f, v...)) }
+
+type gettyConnBackedSession struct {
+	getty.Session
+	conn     net.Conn
+	stopOnce sync.Once
+	done     chan struct{}
+	wTimeout atomic.Int64
+}
+
+func newGettyConnBackedSession(conn net.Conn, wTimeout time.Duration) *gettyConnBackedSession {
+	s := &gettyConnBackedSession{
+		conn: conn,
+		done: make(chan struct{}),
+	}
+	s.wTimeout.Store(int64(wTimeout))
+	return s
+}
+
+func (s *gettyConnBackedSession) Conn() net.Conn {
+	return s.conn
+}
+
+func (s *gettyConnBackedSession) RemoteAddr() string {
+	return "127.0.0.1:8091"
+}
+
+func (s *gettyConnBackedSession) Stat() string {
+	return "getty-conn-backed-session(127.0.0.1:8091)"
+}
+
+func (s *gettyConnBackedSession) IsClosed() bool {
+	select {
+	case <-s.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *gettyConnBackedSession) WriteTimeout() time.Duration {
+	return time.Duration(s.wTimeout.Load())
+}
+
+func (s *gettyConnBackedSession) SetWriteTimeout(d time.Duration) {
+	if d < 1 {
+		panic("@wTimeout < 1")
+	}
+	s.wTimeout.Store(int64(d))
+}
+
+// Close faithfully reproduces dubbo-getty v1.5.0 session.stop() (session.go:849-869):
+// it pushes conn's write deadline forward to now.Add(s.WriteTimeout()) and closes s.done
+// without closing conn itself (conn is only closed later in session.gc()).
+func (s *gettyConnBackedSession) Close() {
+	select {
+	case <-s.done:
+		return
+	default:
+		s.stopOnce.Do(func() {
+			now := time.Now()
+			if conn := s.Conn(); conn != nil {
+				_ = conn.SetWriteDeadline(now.Add(s.WriteTimeout()))
+			}
+			close(s.done)
+		})
+	}
+}
+
+// WriteBytes faithfully reproduces dubbo-getty v1.5.0 session.WriteBytes + gettyTCPConn.Send
+// (session.go:420-453, connection.go:287-331).
+func (s *gettyConnBackedSession) WriteBytes(pkg []byte) (int, error) {
+	if s.IsClosed() {
+		return 0, getty.ErrSessionClosed
+	}
+	if wt := s.WriteTimeout(); wt > 0 {
+		if err := s.conn.SetWriteDeadline(time.Now().Add(wt)); err != nil {
+			return 0, err
+		}
+	}
+	return s.conn.Write(pkg)
+}
+
+func (s *gettyConnBackedSession) WritePkg(pkg any, timeout time.Duration) (int, int, error) {
+	// If WritePkg were ever called instead of sendSessionFrame's WriteBytes path, log pkg:%#v
+	// the exact same way dubbo-getty session.go:413 does so the redaction assertion would catch it.
+	pkgBytes, err := rpcPkgHandler.Write(s, pkg)
+	if err != nil {
+		return 0, 0, err
+	}
+	if timeout > 0 {
+		s.SetWriteTimeout(timeout)
+	}
+	n, sendErr := s.WriteBytes(pkgBytes)
+	if sendErr != nil {
+		log.GetLogger().Warnf("%s, [session.WritePkg] @s.Connection.Write(pkg:%#v) = err:%+v", s.Stat(), pkgBytes, sendErr)
+		return len(pkgBytes), n, sendErr
+	}
+	return len(pkgBytes), n, nil
+}
+
+func canDialLoopbackTCP() bool {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return false
+	}
+	defer func() { _ = ln.Close() }()
+	c, dialErr := net.DialTimeout("tcp", ln.Addr().String(), 100*time.Millisecond)
+	if dialErr != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
+}
+
+func TestSessionWriterRealTCPBackpressureCancelAbortsWriteAndRedactsLogs(t *testing.T) {
+	codec.Init()
+	log.Init()
+	origLogger := log.GetLogger()
+	capLogger := &capturingTestLogger{}
+	log.SetLogger(capLogger)
+	t.Cleanup(func() {
+		log.SetLogger(origLogger)
+	})
+
+	const secretPayload = "TOP-SECRET-REAL-TCP-ORDER-8888"
+	req := message.BranchRegisterRequest{
+		Xid:             "127.0.0.1:8091:992",
+		ResourceId:      "order-v2.RealTCPBackpressure",
+		ApplicationData: []byte(`{"actionContext":{"order_id":"` + secretPayload + `"}}`),
+	}
+
+	// 1. Verify against a real net.Conn (net.Pipe) with dubbo-getty's exact session.stop() Close() semantics
+	// (where Close() resets SetWriteDeadline(now + WriteTimeout) and does not close net.Conn):
+	clientConn, serverConn := net.Pipe()
+	defer func() {
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	}()
+	pipeSess := newGettyConnBackedSession(clientConn, defaultSessionWriteTimeout)
+	registerSessionWriter(pipeSess, defaultSessionWriteTimeout)
+
+	client := newTestClient()
+	ctxPipe, cancelPipe := context.WithCancel(WithSession(context.Background(), pipeSess))
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		cancelPipe()
+	}()
+	startPipe := time.Now()
+	_, pipeErr := client.SendSyncRequestInContext(ctxPipe, req)
+	elapsedPipe := time.Since(startPipe)
+	require.ErrorIs(t, pipeErr, context.Canceled)
+	assert.Less(t, elapsedPipe, 500*time.Millisecond, "cancel must override session.Close() +5s deadline and abort write")
+	assert.True(t, pipeSess.IsClosed())
+	_, postPipeWriteErr := clientConn.Write([]byte("x"))
+	require.Error(t, postPipeWriteErr, "underlying net.Conn write deadline must remain expired after cancel")
+	assert.NotContains(t, capLogger.joined(), secretPayload)
+
+	// 2. When TCP loopback dialing is permitted by the OS environment (e.g. CI and non-sandboxed runs),
+	// also verify against a real *net.TCPConn under kernel send-buffer backpressure.
+	if !canDialLoopbackTCP() {
+		return
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
+
+	acceptedDone := make(chan net.Conn, 1)
+	go func() {
+		srvConn, acceptErr := ln.Accept()
+		if acceptErr == nil {
+			if tcpSrv, ok := srvConn.(*net.TCPConn); ok {
+				_ = tcpSrv.SetReadBuffer(1024)
+			}
+			acceptedDone <- srvConn
+		}
+	}()
+
+	rawConn, dialErr := net.DialTimeout("tcp", ln.Addr().String(), time.Second)
+	require.NoError(t, dialErr)
+	defer func() { _ = rawConn.Close() }()
+	if tcpConn, ok := rawConn.(*net.TCPConn); ok {
+		_ = tcpConn.SetWriteBuffer(1024)
+	}
+
+	srvConn := <-acceptedDone
+	defer func() { _ = srvConn.Close() }()
+
+	realSess := newGettyConnBackedSession(rawConn, defaultSessionWriteTimeout)
+	registerSessionWriter(realSess, defaultSessionWriteTimeout)
+
+	filler := make([]byte, 32*1024)
+	for i := 0; i < 256; i++ {
+		_ = rawConn.SetWriteDeadline(time.Now().Add(5 * time.Millisecond))
+		if _, wErr := rawConn.Write(filler); wErr != nil {
+			break
+		}
+	}
+	_ = rawConn.SetWriteDeadline(time.Time{})
+
+	ctx, cancel := context.WithCancel(WithSession(context.Background(), realSess))
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, sendErr := client.SendSyncRequestInContext(ctx, req)
+	elapsed := time.Since(start)
+
+	require.ErrorIs(t, sendErr, context.Canceled)
+	assert.Less(t, elapsed, 500*time.Millisecond, "cancel must abort in-flight TCP write without waiting for 5s WriteTimeout")
+	assert.True(t, realSess.IsClosed())
+	_, postWriteErr := rawConn.Write([]byte("x"))
+	require.Error(t, postWriteErr)
+	assert.NotContains(t, capLogger.joined(), secretPayload)
 }
