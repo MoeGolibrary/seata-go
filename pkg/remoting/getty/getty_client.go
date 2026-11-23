@@ -43,14 +43,12 @@ type GettyRemotingClient struct {
 }
 
 func GetGettyRemotingClient() *GettyRemotingClient {
-	if gettyRemotingClient == nil {
-		onceGettyRemotingClient.Do(func() {
-			gettyRemotingClient = &GettyRemotingClient{
-				idGenerator:   &atomic.Uint32{},
-				gettyRemoting: newGettyRemoting(),
-			}
-		})
-	}
+	onceGettyRemotingClient.Do(func() {
+		gettyRemotingClient = &GettyRemotingClient{
+			idGenerator:   &atomic.Uint32{},
+			gettyRemoting: newGettyRemoting(),
+		}
+	})
 	return gettyRemotingClient
 }
 
@@ -223,8 +221,9 @@ func (g *GettyRemotingClient) syncCallbackWithContext(ctx context.Context) callb
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-gxtime.GetDefaultTimerWheel().After(rpcRequestTimeout):
-			log.Errorf("wait resp timeout: %#v", reqMsg)
-			return nil, fmt.Errorf("wait response timeout, request: %#v", reqMsg)
+			summary := summarizeRpcMessage(reqMsg)
+			log.Errorf("wait resp timeout: %s", summary)
+			return nil, fmt.Errorf("wait response timeout, request: %s", summary)
 		}
 	}
 }

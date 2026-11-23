@@ -34,6 +34,8 @@ import (
 type gcAwareTestSession struct {
 	getty.Session
 	closed       atomic.Bool
+	closeOnce    sync.Once
+	closeCh      chan struct{}
 	gcDone       atomic.Bool
 	writeCalls   atomic.Int32
 	mu           sync.Mutex
@@ -45,6 +47,7 @@ type gcAwareTestSession struct {
 
 func newGCAwareTestSession(onWrite func(msg message.RpcMessage, timeout time.Duration) error) *gcAwareTestSession {
 	return &gcAwareTestSession{
+		closeCh:     make(chan struct{}),
 		connTimeout: defaultSessionWriteTimeout,
 		onWrite:     onWrite,
 	}
@@ -56,6 +59,9 @@ func (s *gcAwareTestSession) IsClosed() bool {
 
 func (s *gcAwareTestSession) Close() {
 	s.closed.Store(true)
+	s.closeOnce.Do(func() {
+		close(s.closeCh)
+	})
 }
 
 func (s *gcAwareTestSession) simulateGC() {
@@ -291,4 +297,42 @@ func TestReadySessionsReturnsImmediatelyWhenEmpty(t *testing.T) {
 	got := GetGettyRemotingClient().ReadySessions()
 	assert.Empty(t, got)
 	assert.Less(t, time.Since(start), 50*time.Millisecond)
+}
+
+func TestSessionWriterInFlightWriteAbortsOnContextCancelAndRedactsApplicationData(t *testing.T) {
+	client := newTestClient()
+
+	writeEntered := make(chan struct{})
+	var sess *gcAwareTestSession
+	sess = newGCAwareTestSession(func(_ message.RpcMessage, _ time.Duration) error {
+		close(writeEntered)
+		<-sess.closeCh
+		return getty.ErrSessionClosed
+	})
+	registerSessionWriter(sess, defaultSessionWriteTimeout)
+
+	ctx, cancel := context.WithCancel(WithSession(context.Background(), sess))
+	go func() {
+		<-writeEntered
+		time.Sleep(15 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	req := message.BranchRegisterRequest{
+		Xid:             "127.0.0.1:8091:991",
+		ResourceId:      "order-v2.Create",
+		ApplicationData: []byte(`{"actionContext":{"order_id":"SECRET-ORDER-999"}}`),
+	}
+	_, err := client.SendSyncRequestInContext(ctx, req)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Less(t, time.Since(start), 250*time.Millisecond)
+	assert.True(t, sess.IsClosed())
+	assert.Equal(t, 0, countFutures(client.gettyRemoting))
+
+	summary := summarizeRpcMessage(message.RpcMessage{ID: 7, Type: message.RequestTypeRequestSync, Body: req})
+	assert.Contains(t, summary, "127.0.0.1:8091:991")
+	assert.Contains(t, summary, "order-v2.Create")
+	assert.NotContains(t, summary, "SECRET-ORDER-999")
+	assert.NotContains(t, summary, "actionContext")
 }

@@ -44,14 +44,12 @@ type gettyClientHandler struct {
 }
 
 func GetGettyClientHandlerInstance() *gettyClientHandler {
-	if clientHandler == nil {
-		onceClientHandler.Do(func() {
-			clientHandler = &gettyClientHandler{
-				idGenerator:  &atomic.Uint32{},
-				processorMap: make(map[message.MessageType]processor.RemotingProcessor, 0),
-			}
-		})
-	}
+	onceClientHandler.Do(func() {
+		clientHandler = &gettyClientHandler{
+			idGenerator:  &atomic.Uint32{},
+			processorMap: make(map[message.MessageType]processor.RemotingProcessor, 0),
+		}
+	})
 	return clientHandler
 }
 

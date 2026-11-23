@@ -155,8 +155,31 @@ func writeSessionPkg(
 		onReadyToSend(peerAddr)
 	}
 
+	var (
+		inWriteMu sync.Mutex
+		inWrite   = true
+		stopAbort func() bool
+	)
+	if ctx != nil && ctx.Done() != nil {
+		stopAbort = context.AfterFunc(ctx, func() {
+			inWriteMu.Lock()
+			defer inWriteMu.Unlock()
+			if !inWrite {
+				return
+			}
+			abortInFlightSessionWrite(session)
+		})
+	}
+
 	_, _, writeErr := session.WritePkg(msg, writeTimeout)
-	if writeErr != nil {
+	if stopAbort != nil {
+		stopAbort()
+	}
+	inWriteMu.Lock()
+	inWrite = false
+	inWriteMu.Unlock()
+
+	if writeErr != nil || (ctx != nil && ctx.Err() != nil) {
 		w.closed = true
 		needRelease = true
 		if ctx != nil && ctx.Err() != nil {
@@ -165,6 +188,19 @@ func writeSessionPkg(
 		return peerAddr, true, writeErr
 	}
 	return peerAddr, false, nil
+}
+
+func abortInFlightSessionWrite(session getty.Session) {
+	func() {
+		defer func() { _ = recover() }()
+		if conn := session.Conn(); conn != nil {
+			_ = conn.SetWriteDeadline(time.Now())
+		}
+	}()
+	defer func() { _ = recover() }()
+	if !session.IsClosed() {
+		session.Close()
+	}
 }
 
 func releaseBrokenSession(session getty.Session, w *sessionWriter, closeOnWriteErr bool) {
@@ -179,4 +215,34 @@ func releaseBrokenSession(session getty.Session, w *sessionWriter, closeOnWriteE
 		session.Close()
 		sessionWriters.CompareAndDelete(session, w)
 	}
+}
+
+func summarizeRpcMessage(msg message.RpcMessage) string {
+	switch body := msg.Body.(type) {
+	case message.BranchRegisterRequest:
+		return fmt.Sprintf(
+			"RpcMessage{ID:%d, Type:%d, Body:BranchRegisterRequest{Xid:%q, ResourceId:%q, BranchType:%d}}",
+			msg.ID, msg.Type, body.Xid, body.ResourceId, body.BranchType,
+		)
+	case *message.BranchRegisterRequest:
+		if body != nil {
+			return fmt.Sprintf(
+				"RpcMessage{ID:%d, Type:%d, Body:BranchRegisterRequest{Xid:%q, ResourceId:%q, BranchType:%d}}",
+				msg.ID, msg.Type, body.Xid, body.ResourceId, body.BranchType,
+			)
+		}
+	case message.BranchReportRequest:
+		return fmt.Sprintf(
+			"RpcMessage{ID:%d, Type:%d, Body:BranchReportRequest{Xid:%q, BranchId:%d, ResourceId:%q, Status:%d}}",
+			msg.ID, msg.Type, body.Xid, body.BranchId, body.ResourceId, body.Status,
+		)
+	case *message.BranchReportRequest:
+		if body != nil {
+			return fmt.Sprintf(
+				"RpcMessage{ID:%d, Type:%d, Body:BranchReportRequest{Xid:%q, BranchId:%d, ResourceId:%q, Status:%d}}",
+				msg.ID, msg.Type, body.Xid, body.BranchId, body.ResourceId, body.Status,
+			)
+		}
+	}
+	return fmt.Sprintf("RpcMessage{ID:%d, Type:%d, BodyType:%T}", msg.ID, msg.Type, msg.Body)
 }

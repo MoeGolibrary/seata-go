@@ -67,7 +67,7 @@ func (g *GettyRemoting) SendSync(msg message.RpcMessage, s getty.Session, callba
 	}
 	result, addr, err := g.sendAsyncWithContext(context.Background(), s, msg, callback, true, false)
 	if err != nil {
-		log.Errorf("send message: %#v, peer: %s, err: %v", msg, addr, err)
+		log.Errorf("send message: %s, peer: %s, err: %v", summarizeRpcMessage(msg), addr, err)
 		return nil, err
 	}
 	return result, nil
@@ -100,7 +100,7 @@ func (g *GettyRemoting) SendSyncWithContext(
 	}
 	result, addr, err := g.sendAsyncWithContext(ctx, s, msg, callback, true, true)
 	if err != nil {
-		log.Errorf("send message: %#v, peer: %s, err: %v", msg, addr, err)
+		log.Errorf("send message: %s, peer: %s, err: %v", summarizeRpcMessage(msg), addr, err)
 		return nil, err
 	}
 	return result, nil
@@ -119,7 +119,7 @@ func (g *GettyRemoting) SendAsync(msg message.RpcMessage, s getty.Session, callb
 	}
 	_, addr, err := g.sendAsyncWithContext(context.Background(), s, msg, callback, true, false)
 	if err != nil {
-		log.Errorf("send message: %#v, peer: %s, err: %v", msg, addr, err)
+		log.Errorf("send message: %s, peer: %s, err: %v", summarizeRpcMessage(msg), addr, err)
 	}
 	return err
 }
@@ -137,10 +137,11 @@ func (g *GettyRemoting) sendAsyncWithContext(
 	trackRPCCount bool,
 	closeOnWriteErr bool,
 ) (interface{}, string, error) {
+	summary := summarizeRpcMessage(msg)
 	if _, ok := msg.Body.(message.HeartBeatMessage); ok {
-		log.Debug("send async message: {%#v}", msg)
+		log.Debug("send async message: {%s}", summary)
 	} else {
-		log.Infof("send async message: {%#v}", msg)
+		log.Infof("send async message: {%s}", summary)
 	}
 	if session == nil {
 		log.Warn("sendAsyncRequestWithResponse nothing, caused by null channel.")
@@ -177,7 +178,7 @@ func (g *GettyRemoting) sendAsyncWithContext(
 			return nil, peerAddr, fmt.Errorf("session is closed")
 		}
 		if writeFailed && !closeOnWriteErr {
-			log.Errorf("send message: %#v, session: %s", msg, session.Stat())
+			log.Errorf("send message: %s, session: %s", summary, session.Stat())
 		}
 		return nil, peerAddr, err
 	}
