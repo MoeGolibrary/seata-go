@@ -588,3 +588,101 @@ func TestSessionWriterRealTCPBackpressureCancelAbortsWriteAndRedactsLogs(t *test
 	require.Error(t, postWriteErr)
 	assert.NotContains(t, capLogger.joined(), secretPayload)
 }
+
+func TestSessionWriterCancelDuringEncodeNeverResetsDeadlineOrWrites(t *testing.T) {
+	codec.Init()
+	log.Init()
+
+	clientConn, serverConn := net.Pipe()
+	defer func() {
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	}()
+
+	// If Write were called after encode, serverReadDone would receive bytes because serverConn is actively reading.
+	serverReadBytes := make(chan int, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		n, _ := serverConn.Read(buf)
+		serverReadBytes <- n
+	}()
+
+	pipeSess := newGettyConnBackedSession(clientConn, defaultSessionWriteTimeout)
+	registerSessionWriter(pipeSess, defaultSessionWriteTimeout)
+
+	ctx, cancel := context.WithCancel(WithSession(context.Background(), pipeSess))
+	defer cancel()
+
+	origEncode := encodeSessionPkg
+	t.Cleanup(func() {
+		encodeSessionPkg = origEncode
+	})
+	encodeSessionPkg = func(session getty.Session, msg message.RpcMessage) ([]byte, error) {
+		pkgBytes, err := origEncode(session, msg)
+		// Trigger context cancellation while encoding is in progress, and wait briefly so the AfterFunc
+		// callback runs before sendSessionFrame proceeds to the deadline/write step.
+		cancel()
+		time.Sleep(15 * time.Millisecond)
+		return pkgBytes, err
+	}
+
+	client := newTestClient()
+	req := message.BranchRegisterRequest{
+		Xid:             "127.0.0.1:8091:993",
+		ResourceId:      "order-v2.CancelDuringEncode",
+		ApplicationData: []byte(`{"actionContext":{"order_id":"NO-LATE-WRITE"}}`),
+	}
+	_, err := client.SendSyncRequestInContext(ctx, req)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.True(t, pipeSess.IsClosed())
+
+	_, postWriteErr := clientConn.Write([]byte("x"))
+	require.Error(t, postWriteErr, "write deadline must stay expired when canceled during encode")
+
+	select {
+	case n := <-serverReadBytes:
+		t.Fatalf("expected zero bytes written to net.Conn when canceled during encode, got %d bytes", n)
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func TestSessionWriterFailureCleanupUsesLockedConnWithoutRacingOnCloseGC(t *testing.T) {
+	codec.Init()
+	log.Init()
+
+	clientConn, serverConn := net.Pipe()
+	defer func() {
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	}()
+
+	pipeSess := newGettyConnBackedSession(clientConn, defaultSessionWriteTimeout)
+	registerSessionWriter(pipeSess, defaultSessionWriteTimeout)
+
+	ctx, cancel := context.WithCancel(WithSession(context.Background(), pipeSess))
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	// Concurrently simulate dubbo-getty's OnClose + session.gc() zeroing s.conn immediately after closeSessionWriter.
+	gcDone := make(chan struct{})
+	go func() {
+		defer close(gcDone)
+		<-ctx.Done()
+		pipeSess.Close()
+		closeSessionWriter(pipeSess)
+		// Reproduce dubbo-getty session.gc() setting s.Connection = nil after OnClose returns.
+		pipeSess.conn = nil
+	}()
+
+	client := newTestClient()
+	_, err := client.SendSyncRequestInContext(ctx, message.BranchRegisterRequest{
+		Xid:        "127.0.0.1:8091:994",
+		ResourceId: "order-v2.OnCloseGCRace",
+	})
+	<-gcDone
+	require.ErrorIs(t, err, context.Canceled)
+	_, postWriteErr := clientConn.Write([]byte("x"))
+	require.Error(t, postWriteErr, "captured netConn must have expired write deadline even after session.gc() nils session.Conn()")
+}

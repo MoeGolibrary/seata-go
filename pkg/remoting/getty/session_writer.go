@@ -35,6 +35,9 @@ const defaultSessionWriteTimeout = 5 * time.Second
 var (
 	errSessionClosedSentinel = errors.New("session is closed")
 	sessionWriters           sync.Map // map[getty.Session]*sessionWriter
+	encodeSessionPkg         = func(session getty.Session, msg message.RpcMessage) ([]byte, error) {
+		return rpcPkgHandler.Write(session, msg)
+	}
 )
 
 type sessionWriter struct {
@@ -112,11 +115,14 @@ func writeSessionPkg(
 		w.sem <- struct{}{}
 	}
 
-	needRelease := false
+	var (
+		needRelease bool
+		netConn     net.Conn
+	)
 	defer func() {
 		<-w.sem
 		if needRelease {
-			releaseBrokenSession(session, w, closeOnWriteErr)
+			releaseBrokenSession(session, netConn, w, closeOnWriteErr)
 		}
 	}()
 
@@ -126,6 +132,8 @@ func writeSessionPkg(
 		}
 		return "", false, errSessionClosedSentinel
 	}
+
+	netConn = safeSessionConn(session)
 
 	writeTimeout := w.defaultTimeout
 	if writeTimeout <= 0 {
@@ -156,10 +164,10 @@ func writeSessionPkg(
 		onReadyToSend(peerAddr)
 	}
 
-	netConn := safeSessionConn(session)
 	var (
 		inWriteMu sync.Mutex
 		inWrite   = true
+		aborted   bool
 		stopAbort func() bool
 	)
 	if ctx != nil && ctx.Done() != nil {
@@ -169,11 +177,12 @@ func writeSessionPkg(
 			if !inWrite {
 				return
 			}
+			aborted = true
 			abortInFlightSessionWrite(session, netConn)
 		})
 	}
 
-	writeErr := sendSessionFrame(session, netConn, msg, writeTimeout)
+	writeErr := sendSessionFrame(ctx, session, netConn, msg, writeTimeout, &inWriteMu, &inWrite, &aborted)
 	if stopAbort != nil {
 		stopAbort()
 	}
@@ -184,6 +193,9 @@ func writeSessionPkg(
 	if writeErr != nil || (ctx != nil && ctx.Err() != nil) {
 		w.closed = true
 		needRelease = true
+		if netConn != nil {
+			_ = netConn.SetWriteDeadline(time.Unix(1, 0))
+		}
 		if ctx != nil && ctx.Err() != nil {
 			return peerAddr, true, ctx.Err()
 		}
@@ -193,24 +205,48 @@ func writeSessionPkg(
 }
 
 func sendSessionFrame(
+	ctx context.Context,
 	session getty.Session,
 	netConn net.Conn,
 	msg message.RpcMessage,
 	writeTimeout time.Duration,
+	inWriteMu *sync.Mutex,
+	inWrite *bool,
+	aborted *bool,
 ) (err error) {
 	if netConn != nil {
-		pkgBytes, encErr := rpcPkgHandler.Write(session, msg)
+		pkgBytes, encErr := encodeSessionPkg(session, msg)
 		if encErr != nil {
 			return encErr
 		}
+		inWriteMu.Lock()
+		if *aborted || !*inWrite || (ctx != nil && ctx.Err() != nil) {
+			_ = netConn.SetWriteDeadline(time.Unix(1, 0))
+			inWriteMu.Unlock()
+			if ctx != nil && ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return context.Canceled
+		}
 		if writeTimeout > 0 {
 			if dlErr := netConn.SetWriteDeadline(time.Now().Add(writeTimeout)); dlErr != nil {
+				inWriteMu.Unlock()
 				return dlErr
 			}
 		}
+		inWriteMu.Unlock()
 		_, sendErr := netConn.Write(pkgBytes)
 		return sendErr
 	}
+	inWriteMu.Lock()
+	if *aborted || !*inWrite || (ctx != nil && ctx.Err() != nil) {
+		inWriteMu.Unlock()
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return context.Canceled
+	}
+	inWriteMu.Unlock()
 	_, _, err = session.WritePkg(msg, writeTimeout)
 	return err
 }
@@ -241,10 +277,10 @@ func abortInFlightSessionWrite(session getty.Session, netConn net.Conn) {
 	}
 }
 
-func releaseBrokenSession(session getty.Session, w *sessionWriter, closeOnWriteErr bool) {
+func releaseBrokenSession(session getty.Session, netConn net.Conn, w *sessionWriter, closeOnWriteErr bool) {
 	defer func() {
-		if conn := safeSessionConn(session); conn != nil {
-			_ = conn.SetWriteDeadline(time.Unix(1, 0))
+		if netConn != nil {
+			_ = netConn.SetWriteDeadline(time.Unix(1, 0))
 		}
 	}()
 	if sessionManager != nil {
