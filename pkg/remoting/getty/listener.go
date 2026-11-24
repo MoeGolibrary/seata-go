@@ -44,26 +44,25 @@ type gettyClientHandler struct {
 }
 
 func GetGettyClientHandlerInstance() *gettyClientHandler {
-	if clientHandler == nil {
-		onceClientHandler.Do(func() {
-			clientHandler = &gettyClientHandler{
-				idGenerator:  &atomic.Uint32{},
-				processorMap: make(map[message.MessageType]processor.RemotingProcessor, 0),
-			}
-		})
-	}
+	onceClientHandler.Do(func() {
+		clientHandler = &gettyClientHandler{
+			idGenerator:  &atomic.Uint32{},
+			processorMap: make(map[message.MessageType]processor.RemotingProcessor, 0),
+		}
+	})
 	return clientHandler
 }
 
 func (g *gettyClientHandler) OnOpen(session getty.Session) error {
 	log.Infof("Open new getty session ")
+	sessionLabel := safeSessionLabel(session)
 	// Each TC only accepts requests from channels registered with it, so the
 	// registration must go out on this session, and the session must not carry
 	// other requests until it is done.
 	sessionManager.registerPendingSession(session)
-	go func() {
+	go func(label string) {
 		if err := registerTM(WithSession(context.Background(), session)); err != nil {
-			log.Errorf("register TM on session %s error: {%v}", session.Stat(), err)
+			log.Errorf("register TM on session %s error: {%v}", label, err)
 			sessionManager.releaseSession(session)
 			return
 		}
@@ -74,7 +73,7 @@ func (g *gettyClientHandler) OnOpen(session getty.Session) error {
 			log.Errorf("register cached RM resources error: {%v}", err)
 			sessionManager.releaseSession(session)
 		}
-	}()
+	}(sessionLabel)
 
 	return nil
 }
@@ -99,18 +98,26 @@ func registerTM(ctx context.Context) error {
 	if !response.Identified {
 		return fmt.Errorf("register TM rejected: %s", response.Msg)
 	}
-	log.Infof("register TM success on session %s", SessionFromContext(ctx).Stat())
+	log.Infof("register TM success on session %s", safeSessionLabel(SessionFromContext(ctx)))
 	return nil
 }
 
 func (g *gettyClientHandler) OnError(session getty.Session, err error) {
-	log.Infof("session{%s} got error{%v}, will be closed.", session.Stat(), err)
+	log.Infof("session{%s} got error{%v}, will be closed.", safeSessionLabel(session), err)
 	sessionManager.releaseSession(session)
 }
 
 func (g *gettyClientHandler) OnClose(session getty.Session) {
-	log.Infof("session{%s} is closing......", session.Stat())
-	sessionManager.releaseSession(session)
+	log.Infof("session{%s} is closing......", safeSessionLabel(session))
+	if sessionManager != nil {
+		sessionManager.releaseSession(session)
+	}
+	if session != nil && !session.IsClosed() {
+		session.Close()
+	}
+	// Block OnClose from returning into dubbo-getty's session.gc() (which nils s.Connection)
+	// until any in-flight WritePkg finishes, and mark the session closed under the same lock.
+	closeSessionWriter(session)
 }
 
 func (g *gettyClientHandler) OnMessage(session getty.Session, pkg interface{}) {
@@ -138,7 +145,8 @@ func (g *gettyClientHandler) OnMessage(session getty.Session, pkg interface{}) {
 }
 
 func (g *gettyClientHandler) OnCron(session getty.Session) {
-	log.Debug("session{%s} Oncron executing", session.Stat())
+	sessionLabel := safeSessionLabel(session)
+	log.Debug("session{%s} Oncron executing", sessionLabel)
 	err := g.transferHeartBeat(session, message.HeartBeatMessagePing)
 	if err != nil {
 		log.Warnf("failed to send heart beat: {%#v}", err.Error())
@@ -146,8 +154,10 @@ func (g *gettyClientHandler) OnCron(session getty.Session) {
 			retryTimes := session.GetAttribute(heartBeatRetryTimesKey).(int)
 			if retryTimes >= maxHeartBeatRetryTimes {
 				log.Warnf("heartbeat retry times exceed default max retry times{%d}, close the session{%s}",
-					maxHeartBeatRetryTimes, session.Stat())
-				sessionManager.releaseSession(session)
+					maxHeartBeatRetryTimes, sessionLabel)
+				if sessionManager != nil {
+					sessionManager.releaseSession(session)
+				}
 				return
 			}
 			session.SetAttribute(heartBeatRetryTimesKey, retryTimes+1)
