@@ -178,7 +178,7 @@ func (g *GettyRemoting) sendAsyncWithContext(
 			return nil, peerAddr, fmt.Errorf("session is closed")
 		}
 		if writeFailed && !closeOnWriteErr {
-			log.Errorf("send message: %s, session: %s", summary, session.Stat())
+			log.Errorf("send message: %s, session: %s", summary, peerAddr)
 		}
 		return nil, peerAddr, err
 	}

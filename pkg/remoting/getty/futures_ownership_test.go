@@ -112,7 +112,6 @@ func TestSendAsyncRemovesFutureOnWriteError(t *testing.T) {
 	session := mock.NewMockTestSession(ctrl)
 	session.EXPECT().IsClosed().Return(false)
 	session.EXPECT().WritePkg(gomock.Any(), gomock.Any()).Return(0, 0, errors.New("write failed"))
-	session.EXPECT().Stat().Return("mock session")
 
 	remoting := newGettyRemoting()
 	callback := func(message.RpcMessage, *message.MessageFuture) (interface{}, error) {
@@ -142,9 +141,6 @@ func TestSendAsyncWithoutCallbackPreservesInFlightFuture(t *testing.T) {
 			session := mock.NewMockTestSession(ctrl)
 			session.EXPECT().IsClosed().Return(false)
 			session.EXPECT().WritePkg(gomock.Any(), gomock.Any()).Return(0, 0, test.writeErr)
-			if test.writeErr != nil {
-				session.EXPECT().Stat().Return("mock session")
-			}
 
 			remoting := newGettyRemoting()
 			msg := message.RpcMessage{ID: 11}
@@ -192,7 +188,6 @@ func TestSendSyncTimeoutLeavesNoFuture(t *testing.T) {
 	session := mock.NewMockTestSession(ctrl)
 	session.EXPECT().IsClosed().Return(false).AnyTimes()
 	session.EXPECT().RemoteAddr().Return("127.0.0.1:8091").AnyTimes()
-	session.EXPECT().Stat().Return("mock session").AnyTimes()
 	session.EXPECT().WritePkg(gomock.Any(), gomock.Any()).Return(0, 0, nil).AnyTimes()
 
 	client := newTestClient()

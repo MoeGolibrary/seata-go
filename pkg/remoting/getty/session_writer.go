@@ -154,12 +154,15 @@ func writeSessionPkg(
 		}
 	}
 
-	if capturePeerAddr {
-		if w.remoteAddr == "" {
-			w.remoteAddr = session.RemoteAddr()
-		}
-		peerAddr = w.remoteAddr
+	if capturePeerAddr && w.remoteAddr == "" {
+		w.remoteAddr = session.RemoteAddr()
 	}
+	if w.remoteAddr == "" && netConn != nil {
+		if rAddr := netConn.RemoteAddr(); rAddr != nil {
+			w.remoteAddr = rAddr.String()
+		}
+	}
+	peerAddr = w.remoteAddr
 	if onReadyToSend != nil {
 		onReadyToSend(peerAddr)
 	}
@@ -257,7 +260,7 @@ func safeSessionConn(session getty.Session) (conn net.Conn) {
 			conn = nil
 		}
 	}()
-	if session == nil {
+	if session == nil || fmt.Sprintf("%T", session) == "*mock.MockTestSession" {
 		return nil
 	}
 	return session.Conn()

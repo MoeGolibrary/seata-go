@@ -398,6 +398,10 @@ func (s *gettyConnBackedSession) RemoteAddr() string {
 }
 
 func (s *gettyConnBackedSession) Stat() string {
+	// Reproduce dubbo-getty v1.5.0 session.Stat() reading s.Connection without a lock.
+	if s.conn == nil {
+		return ""
+	}
 	return "getty-conn-backed-session(127.0.0.1:8091)"
 }
 
@@ -685,4 +689,33 @@ func TestSessionWriterFailureCleanupUsesLockedConnWithoutRacingOnCloseGC(t *test
 	require.ErrorIs(t, err, context.Canceled)
 	_, postWriteErr := clientConn.Write([]byte("x"))
 	require.Error(t, postWriteErr, "captured netConn must have expired write deadline even after session.gc() nils session.Conn()")
+
+	// Also verify the Phase 2 SendAsyncResponseInContext path (closeOnWriteErr=false) when the
+	// peer disconnects mid-write and OnClose + session.gc() concurrently nils session.conn:
+	// logging the failure must use the lock-captured peerAddr instead of calling session.Stat() after unlock.
+	clientConn2, serverConn2 := net.Pipe()
+	defer func() {
+		_ = clientConn2.Close()
+		_ = serverConn2.Close()
+	}()
+	pipeSess2 := newGettyConnBackedSession(clientConn2, defaultSessionWriteTimeout)
+	registerSessionWriter(pipeSess2, defaultSessionWriteTimeout)
+
+	gcDone2 := make(chan struct{})
+	go func() {
+		defer close(gcDone2)
+		time.Sleep(20 * time.Millisecond)
+		_ = clientConn2.SetWriteDeadline(time.Unix(1, 0))
+		pipeSess2.Close()
+		closeSessionWriter(pipeSess2)
+		pipeSess2.conn = nil
+	}()
+
+	asyncErr := client.SendAsyncResponseInContext(
+		WithSession(context.Background(), pipeSess2),
+		77,
+		message.BranchCommitResponse{},
+	)
+	<-gcDone2
+	require.Error(t, asyncErr)
 }
