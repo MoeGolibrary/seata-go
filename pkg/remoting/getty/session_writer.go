@@ -97,7 +97,23 @@ func safeSessionLabel(session getty.Session) string {
 		return "session-closed"
 	}
 	if existing, ok := sessionWriters.Load(session); ok {
-		if addr := existing.(*sessionWriter).getRemoteAddr(); addr != "" {
+		w := existing.(*sessionWriter)
+		if addr := w.getRemoteAddr(); addr != "" {
+			return addr
+		}
+		w.sem <- struct{}{}
+		if !w.closed && !session.IsClosed() {
+			addr := session.RemoteAddr()
+			w.setRemoteAddr(addr)
+			<-w.sem
+			if addr != "" {
+				return addr
+			}
+			return "session"
+		}
+		addr := w.getRemoteAddr()
+		<-w.sem
+		if addr != "" {
 			return addr
 		}
 	}
@@ -108,22 +124,8 @@ func safeSessionLabel(session getty.Session) string {
 			}
 		}
 	}
-	w := getOrCreateSessionWriter(session)
-	if addr := w.getRemoteAddr(); addr != "" {
-		return addr
-	}
-	w.sem <- struct{}{}
-	defer func() { <-w.sem }()
-	if w.closed || session.IsClosed() {
-		if addr := w.getRemoteAddr(); addr != "" {
-			return addr
-		}
+	if session.IsClosed() {
 		return "session-closed"
-	}
-	addr := session.RemoteAddr()
-	w.setRemoteAddr(addr)
-	if addr != "" {
-		return addr
 	}
 	return "session"
 }

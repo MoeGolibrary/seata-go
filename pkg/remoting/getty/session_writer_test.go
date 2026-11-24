@@ -755,4 +755,9 @@ func TestSessionWriterFailureCleanupUsesLockedConnWithoutRacingOnCloseGC(t *test
 	GetGettyClientHandlerInstance().OnCron(pipeSess3)
 	<-gcDone3
 	assert.Equal(t, "session-closed", safeSessionLabel(pipeSess3))
+	_, cachedAfterClose := sessionWriters.Load(pipeSess3)
+	assert.False(t, cachedAfterClose, "safeSessionLabel and post-close OnCron must not re-cache closed session in sessionWriters")
+	GetGettyClientHandlerInstance().OnCron(pipeSess3)
+	_, cachedAfterLateCron := sessionWriters.Load(pipeSess3)
+	assert.False(t, cachedAfterLateCron, "late OnCron after OnClose must not insert closed session into sessionWriters")
 }
