@@ -652,12 +652,12 @@ func (g *SessionManager) releaseSession(session getty.Session) {
 	if session == nil {
 		return
 	}
-	address := g.sessionServerAddress(session)
-	defer g.sessionAddresses.Delete(session)
 	defer g.pendingSessions.Delete(session)
 	if _, loaded := g.allSessions.LoadAndDelete(session); !loaded {
 		return
 	}
+	address := g.sessionServerAddress(session)
+	defer g.sessionAddresses.Delete(session)
 	if m, ok := g.serverSessions.Load(address); ok {
 		sMap := m.(*sync.Map)
 		sMap.Delete(session)
@@ -671,6 +671,7 @@ func (g *SessionManager) releaseSession(session getty.Session) {
 
 func (g *SessionManager) registerSession(session getty.Session) {
 	address := g.sessionServerAddress(session)
+	g.sessionAddresses.LoadOrStore(session, address)
 	if !g.isServerAddressAvailable(address) {
 		log.Warnf("skip session for removed server address: %s", address)
 		session.Close()

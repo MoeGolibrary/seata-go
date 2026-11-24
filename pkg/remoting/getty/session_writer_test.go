@@ -378,15 +378,30 @@ type gettyConnBackedSession struct {
 	stopOnce sync.Once
 	done     chan struct{}
 	wTimeout atomic.Int64
+	attrMu   sync.RWMutex
+	attrs    map[any]any
 }
 
 func newGettyConnBackedSession(conn net.Conn, wTimeout time.Duration) *gettyConnBackedSession {
 	s := &gettyConnBackedSession{
-		conn: conn,
-		done: make(chan struct{}),
+		conn:  conn,
+		done:  make(chan struct{}),
+		attrs: make(map[any]any),
 	}
 	s.wTimeout.Store(int64(wTimeout))
 	return s
+}
+
+func (s *gettyConnBackedSession) GetAttribute(key any) any {
+	s.attrMu.RLock()
+	defer s.attrMu.RUnlock()
+	return s.attrs[key]
+}
+
+func (s *gettyConnBackedSession) SetAttribute(key, value any) {
+	s.attrMu.Lock()
+	defer s.attrMu.Unlock()
+	s.attrs[key] = value
 }
 
 func (s *gettyConnBackedSession) Conn() net.Conn {
@@ -718,4 +733,26 @@ func TestSessionWriterFailureCleanupUsesLockedConnWithoutRacingOnCloseGC(t *test
 	)
 	<-gcDone2
 	require.Error(t, asyncErr)
+
+	// 3. Also verify OnCron + TM handshake label logging against concurrent OnClose + session.gc().
+	clientConn3, serverConn3 := net.Pipe()
+	defer func() {
+		_ = clientConn3.Close()
+		_ = serverConn3.Close()
+	}()
+	pipeSess3 := newGettyConnBackedSession(clientConn3, defaultSessionWriteTimeout)
+	pipeSess3.SetAttribute(heartBeatRetryTimesKey, maxHeartBeatRetryTimes)
+	registerSessionWriter(pipeSess3, defaultSessionWriteTimeout)
+
+	gcDone3 := make(chan struct{})
+	go func() {
+		defer close(gcDone3)
+		time.Sleep(15 * time.Millisecond)
+		_ = clientConn3.SetWriteDeadline(time.Unix(1, 0))
+		GetGettyClientHandlerInstance().OnClose(pipeSess3)
+		pipeSess3.conn = nil
+	}()
+	GetGettyClientHandlerInstance().OnCron(pipeSess3)
+	<-gcDone3
+	assert.Equal(t, "session-closed", safeSessionLabel(pipeSess3))
 }

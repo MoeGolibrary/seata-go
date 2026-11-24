@@ -44,7 +44,25 @@ type sessionWriter struct {
 	sem            chan struct{}
 	closed         bool
 	defaultTimeout time.Duration
+	addrMu         sync.RWMutex
 	remoteAddr     string
+}
+
+func (w *sessionWriter) getRemoteAddr() string {
+	w.addrMu.RLock()
+	defer w.addrMu.RUnlock()
+	return w.remoteAddr
+}
+
+func (w *sessionWriter) setRemoteAddr(addr string) {
+	if addr == "" {
+		return
+	}
+	w.addrMu.Lock()
+	if w.remoteAddr == "" {
+		w.remoteAddr = addr
+	}
+	w.addrMu.Unlock()
 }
 
 func newSessionWriter(defaultTimeout time.Duration, remoteAddr string) *sessionWriter {
@@ -72,6 +90,42 @@ func getOrCreateSessionWriter(session getty.Session) *sessionWriter {
 	created := newSessionWriter(defaultSessionWriteTimeout, "")
 	actual, _ := sessionWriters.LoadOrStore(session, created)
 	return actual.(*sessionWriter)
+}
+
+func safeSessionLabel(session getty.Session) string {
+	if session == nil {
+		return "session-closed"
+	}
+	if existing, ok := sessionWriters.Load(session); ok {
+		if addr := existing.(*sessionWriter).getRemoteAddr(); addr != "" {
+			return addr
+		}
+	}
+	if sessionManager != nil {
+		if addr, ok := sessionManager.sessionAddresses.Load(session); ok {
+			if s, isStr := addr.(string); isStr && s != "" {
+				return s
+			}
+		}
+	}
+	w := getOrCreateSessionWriter(session)
+	if addr := w.getRemoteAddr(); addr != "" {
+		return addr
+	}
+	w.sem <- struct{}{}
+	defer func() { <-w.sem }()
+	if w.closed || session.IsClosed() {
+		if addr := w.getRemoteAddr(); addr != "" {
+			return addr
+		}
+		return "session-closed"
+	}
+	addr := session.RemoteAddr()
+	w.setRemoteAddr(addr)
+	if addr != "" {
+		return addr
+	}
+	return "session"
 }
 
 // closeSessionWriter serializes session teardown with in-flight WritePkg calls
@@ -154,15 +208,15 @@ func writeSessionPkg(
 		}
 	}
 
-	if capturePeerAddr && w.remoteAddr == "" {
-		w.remoteAddr = session.RemoteAddr()
+	if capturePeerAddr && w.getRemoteAddr() == "" {
+		w.setRemoteAddr(session.RemoteAddr())
 	}
-	if w.remoteAddr == "" && netConn != nil {
+	if w.getRemoteAddr() == "" && netConn != nil {
 		if rAddr := netConn.RemoteAddr(); rAddr != nil {
-			w.remoteAddr = rAddr.String()
+			w.setRemoteAddr(rAddr.String())
 		}
 	}
-	peerAddr = w.remoteAddr
+	peerAddr = w.getRemoteAddr()
 	if onReadyToSend != nil {
 		onReadyToSend(peerAddr)
 	}

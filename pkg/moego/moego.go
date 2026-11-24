@@ -30,5 +30,5 @@ const (
 	UpstreamBase = "0dde9d23592d"
 
 	// Version 是 fork 的版本号，发版时改成与 git tag 一致；未发版时为 "dev"。
-	Version = "v2.2.0-moego.5"
+	Version = "v2.2.0-moego.6"
 )

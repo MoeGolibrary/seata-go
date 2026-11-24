@@ -164,7 +164,7 @@ func (client *GettyRemotingClient) ForEachReadySession(fn func(ctx context.Conte
 	succeeded := 0
 	for _, session := range sessions {
 		if err := fn(WithSession(context.Background(), session)); err != nil {
-			log.Errorf("request on session %s failed, release it: %v", session.Stat(), err)
+			log.Errorf("request on session %s failed, release it: %v", safeSessionLabel(session), err)
 			sessionManager.releaseSession(session)
 			errs = append(errs, err)
 			continue
