@@ -653,16 +653,72 @@ func TestSessionWriterCancelDuringEncodeNeverResetsDeadlineOrWrites(t *testing.T
 	}
 	_, err := client.SendSyncRequestInContext(ctx, req)
 	require.ErrorIs(t, err, context.Canceled)
-	assert.True(t, pipeSess.IsClosed())
-
-	_, postWriteErr := clientConn.Write([]byte("x"))
-	require.Error(t, postWriteErr, "write deadline must stay expired when canceled during encode")
+	assert.False(t, pipeSess.IsClosed(), "canceling before socket Write starts must NOT close the shared session")
+	assert.Equal(t, 0, countFutures(client.gettyRemoting))
 
 	select {
 	case n := <-serverReadBytes:
 		t.Fatalf("expected zero bytes written to net.Conn when canceled during encode, got %d bytes", n)
 	case <-time.After(30 * time.Millisecond):
 	}
+
+	// Restore encodeSessionPkg and verify the shared session is still healthy and writable for subsequent requests.
+	encodeSessionPkg = origEncode
+	nWritten, postWriteErr := clientConn.Write([]byte("ok"))
+	require.NoError(t, postWriteErr, "shared session net.Conn must remain writable after pre-write cancel")
+	assert.Equal(t, 2, nWritten)
+	assert.Equal(t, 2, <-serverReadBytes)
+}
+
+func TestSessionWriterPostWriteContextCancelKeepsSharedSessionOpenAndCleansFuture(t *testing.T) {
+	codec.Init()
+	log.Init()
+
+	clientConn, serverConn := net.Pipe()
+	defer func() {
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	}()
+
+	pipeSess := newGettyConnBackedSession(clientConn, defaultSessionWriteTimeout)
+	registerSessionWriter(pipeSess, defaultSessionWriteTimeout)
+
+	ctx, cancel := context.WithCancel(WithSession(context.Background(), pipeSess))
+	defer cancel()
+
+	// Drain the full frame on serverConn so netConn.Write succeeds completely (writeErr == nil),
+	// then immediately cancel ctx while SendSyncRequestInContext is waiting for the RPC response.
+	frameReceived := make(chan int, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		n, readErr := serverConn.Read(buf)
+		if readErr == nil && n > 0 {
+			frameReceived <- n
+			cancel()
+		}
+	}()
+
+	client := newTestClient()
+	req := message.BranchRegisterRequest{
+		Xid:        "127.0.0.1:8091:993b",
+		ResourceId: "order-v2.CancelAfterFullWrite",
+	}
+	_, err := client.SendSyncRequestInContext(ctx, req)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Greater(t, <-frameReceived, 0)
+	assert.False(t, pipeSess.IsClosed(), "full write followed by ctx cancel must NOT tear down shared session")
+	assert.Equal(t, 0, countFutures(client.gettyRemoting))
+
+	// Verify subsequent writes on the shared session still succeed.
+	doneRead := make(chan int, 1)
+	go func() {
+		buf := make([]byte, 64)
+		n, _ := serverConn.Read(buf)
+		doneRead <- n
+	}()
+	_, secondWriteErr := clientConn.Write([]byte("next"))
+	require.NoError(t, secondWriteErr)
+	assert.Equal(t, 4, <-doneRead)
 }
 
 func TestSessionWriterFailureCleanupUsesLockedConnWithoutRacingOnCloseGC(t *testing.T) {

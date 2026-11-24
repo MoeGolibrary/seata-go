@@ -38,6 +38,9 @@ var (
 	encodeSessionPkg         = func(session getty.Session, msg message.RpcMessage) ([]byte, error) {
 		return rpcPkgHandler.Write(session, msg)
 	}
+	sessionConnOf = func(session getty.Session) net.Conn {
+		return session.Conn()
+	}
 )
 
 type sessionWriter struct {
@@ -223,44 +226,23 @@ func writeSessionPkg(
 		onReadyToSend(peerAddr)
 	}
 
-	var (
-		inWriteMu sync.Mutex
-		inWrite   = true
-		aborted   bool
-		stopAbort func() bool
-	)
-	if ctx != nil && ctx.Done() != nil {
-		stopAbort = context.AfterFunc(ctx, func() {
-			inWriteMu.Lock()
-			defer inWriteMu.Unlock()
-			if !inWrite {
-				return
-			}
-			aborted = true
-			abortInFlightSessionWrite(session, netConn)
-		})
-	}
-
-	writeErr := sendSessionFrame(ctx, session, netConn, msg, writeTimeout, &inWriteMu, &inWrite, &aborted)
-	if stopAbort != nil {
-		stopAbort()
-	}
-	inWriteMu.Lock()
-	inWrite = false
-	inWriteMu.Unlock()
-
-	if writeErr != nil || (ctx != nil && ctx.Err() != nil) {
+	started, writeErr := sendSessionFrame(ctx, session, netConn, msg, writeTimeout)
+	if writeErr != nil && started {
 		w.closed = true
 		needRelease = true
 		if netConn != nil {
 			_ = netConn.SetWriteDeadline(time.Unix(1, 0))
 		}
-		if ctx != nil && ctx.Err() != nil {
-			return peerAddr, true, ctx.Err()
-		}
 		return peerAddr, true, writeErr
 	}
+	if writeErr != nil {
+		return peerAddr, false, writeErr
+	}
 	return peerAddr, false, nil
+}
+
+func isCompressEncodingEnabled() bool {
+	return sessionManager != nil && sessionManager.gettyConf.SessionConfig.CompressEncoding
 }
 
 func sendSessionFrame(
@@ -269,45 +251,105 @@ func sendSessionFrame(
 	netConn net.Conn,
 	msg message.RpcMessage,
 	writeTimeout time.Duration,
-	inWriteMu *sync.Mutex,
-	inWrite *bool,
-	aborted *bool,
-) (err error) {
-	if netConn != nil {
+) (started bool, err error) {
+	// When Getty zip compression is enabled on the session, fall back to session.WritePkg
+	// so frames continue flowing through dubbo-getty's compressed connection wrapper.
+	if netConn != nil && !isCompressEncodingEnabled() {
 		pkgBytes, encErr := encodeSessionPkg(session, msg)
 		if encErr != nil {
-			return encErr
+			return false, encErr
 		}
+		var (
+			inWriteMu sync.Mutex
+			inWrite   bool
+			stopAbort func() bool
+		)
 		inWriteMu.Lock()
-		if *aborted || !*inWrite || (ctx != nil && ctx.Err() != nil) {
-			_ = netConn.SetWriteDeadline(time.Unix(1, 0))
+		if ctx != nil && ctx.Err() != nil {
 			inWriteMu.Unlock()
-			if ctx != nil && ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return context.Canceled
+			return false, ctx.Err()
 		}
 		if writeTimeout > 0 {
 			if dlErr := netConn.SetWriteDeadline(time.Now().Add(writeTimeout)); dlErr != nil {
 				inWriteMu.Unlock()
-				return dlErr
+				return false, dlErr
 			}
 		}
-		inWriteMu.Unlock()
-		_, sendErr := netConn.Write(pkgBytes)
-		return sendErr
-	}
-	inWriteMu.Lock()
-	if *aborted || !*inWrite || (ctx != nil && ctx.Err() != nil) {
-		inWriteMu.Unlock()
-		if ctx != nil && ctx.Err() != nil {
-			return ctx.Err()
+		inWrite = true
+		if ctx != nil && ctx.Done() != nil {
+			stopAbort = context.AfterFunc(ctx, func() {
+				inWriteMu.Lock()
+				defer inWriteMu.Unlock()
+				if !inWrite {
+					return
+				}
+				abortInFlightSessionWrite(session, netConn)
+			})
 		}
-		return context.Canceled
+		inWriteMu.Unlock()
+
+		_, sendErr := netConn.Write(pkgBytes)
+		abortedCallbackFired := stopAbort != nil && !stopAbort()
+		inWriteMu.Lock()
+		inWrite = false
+		inWriteMu.Unlock()
+
+		if sendErr != nil {
+			if ctx != nil && ctx.Err() != nil {
+				return true, ctx.Err()
+			}
+			return true, sendErr
+		}
+		if abortedCallbackFired {
+			// The full frame was already written before or as ctx expired; restore a clean
+			// deadline so subsequent writes on this shared session are not affected.
+			_ = netConn.SetWriteDeadline(time.Time{})
+		}
+		return true, nil
+	}
+
+	var (
+		inWriteMu sync.Mutex
+		inWrite   bool
+		stopAbort func() bool
+	)
+	inWriteMu.Lock()
+	if ctx != nil && ctx.Err() != nil {
+		inWriteMu.Unlock()
+		return false, ctx.Err()
+	}
+	inWrite = true
+	if ctx != nil && ctx.Done() != nil {
+		stopAbort = context.AfterFunc(ctx, func() {
+			inWriteMu.Lock()
+			defer inWriteMu.Unlock()
+			if !inWrite {
+				return
+			}
+			abortInFlightSessionWrite(session, nil)
+		})
 	}
 	inWriteMu.Unlock()
+
 	_, _, err = session.WritePkg(msg, writeTimeout)
-	return err
+	abortedCallbackFired := stopAbort != nil && !stopAbort()
+	inWriteMu.Lock()
+	inWrite = false
+	inWriteMu.Unlock()
+
+	if err != nil {
+		if ctx != nil && ctx.Err() != nil {
+			return true, ctx.Err()
+		}
+		return true, err
+	}
+	if abortedCallbackFired && session.IsClosed() {
+		if ctx != nil && ctx.Err() != nil {
+			return true, ctx.Err()
+		}
+		return true, errSessionClosedSentinel
+	}
+	return true, nil
 }
 
 func safeSessionConn(session getty.Session) (conn net.Conn) {
@@ -316,10 +358,10 @@ func safeSessionConn(session getty.Session) (conn net.Conn) {
 			conn = nil
 		}
 	}()
-	if session == nil || fmt.Sprintf("%T", session) == "*mock.MockTestSession" {
+	if session == nil || sessionConnOf == nil {
 		return nil
 	}
-	return session.Conn()
+	return sessionConnOf(session)
 }
 
 func abortInFlightSessionWrite(session getty.Session, netConn net.Conn) {
