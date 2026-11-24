@@ -252,9 +252,7 @@ func sendSessionFrame(
 	msg message.RpcMessage,
 	writeTimeout time.Duration,
 ) (started bool, err error) {
-	// When Getty zip compression is enabled on the session, fall back to session.WritePkg
-	// so frames continue flowing through dubbo-getty's compressed connection wrapper.
-	if netConn != nil && !isCompressEncodingEnabled() {
+	if netConn != nil {
 		pkgBytes, encErr := encodeSessionPkg(session, msg)
 		if encErr != nil {
 			return false, encErr
@@ -288,11 +286,20 @@ func sendSessionFrame(
 		}
 		inWriteMu.Unlock()
 
-		_, sendErr := netConn.Write(pkgBytes)
-		abortedCallbackFired := stopAbort != nil && !stopAbort()
+		var sendErr error
+		if isCompressEncodingEnabled() {
+			// When Getty zip compression is enabled on the session, write the encoded frame
+			// through session.WriteBytes so bytes flow through dubbo-getty's compressed writer
+			// while still using netConn's write deadline for in-flight cancellation.
+			_, sendErr = session.WriteBytes(pkgBytes)
+		} else {
+			_, sendErr = netConn.Write(pkgBytes)
+		}
+
 		inWriteMu.Lock()
 		inWrite = false
 		inWriteMu.Unlock()
+		abortedCallbackFired := stopAbort != nil && !stopAbort()
 
 		if sendErr != nil {
 			if ctx != nil && ctx.Err() != nil {
@@ -332,10 +339,10 @@ func sendSessionFrame(
 	inWriteMu.Unlock()
 
 	_, _, err = session.WritePkg(msg, writeTimeout)
-	abortedCallbackFired := stopAbort != nil && !stopAbort()
 	inWriteMu.Lock()
 	inWrite = false
 	inWriteMu.Unlock()
+	abortedCallbackFired := stopAbort != nil && !stopAbort()
 
 	if err != nil {
 		if ctx != nil && ctx.Err() != nil {

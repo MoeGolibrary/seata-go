@@ -459,14 +459,16 @@ func (s *gettyConnBackedSession) Close() {
 }
 
 // WriteBytes faithfully reproduces dubbo-getty v1.5.0 session.WriteBytes + gettyTCPConn.Send
-// (session.go:420-453, connection.go:287-331).
+// (session.go:420-453, connection.go:287-331, where t.conn.SetWriteDeadline is only set when t.compress == CompressNone).
 func (s *gettyConnBackedSession) WriteBytes(pkg []byte) (int, error) {
 	if s.IsClosed() {
 		return 0, getty.ErrSessionClosed
 	}
-	if wt := s.WriteTimeout(); wt > 0 {
-		if err := s.conn.SetWriteDeadline(time.Now().Add(wt)); err != nil {
-			return 0, err
+	if !isCompressEncodingEnabled() {
+		if wt := s.WriteTimeout(); wt > 0 {
+			if err := s.conn.SetWriteDeadline(time.Now().Add(wt)); err != nil {
+				return 0, err
+			}
 		}
 	}
 	return s.conn.Write(pkg)
@@ -719,6 +721,46 @@ func TestSessionWriterPostWriteContextCancelKeepsSharedSessionOpenAndCleansFutur
 	_, secondWriteErr := clientConn.Write([]byte("next"))
 	require.NoError(t, secondWriteErr)
 	assert.Equal(t, 4, <-doneRead)
+
+	// Also verify CompressEncoding=true path (session.WriteBytes) preserves shared session on
+	// both pre-write (during encode) and post-write context cancellation.
+	prevMgr := sessionManager
+	sessionManager = newTestSessionManager(nil)
+	sessionManager.gettyConf.SessionConfig.CompressEncoding = true
+	t.Cleanup(func() {
+		sessionManager = prevMgr
+	})
+
+	origEncode := encodeSessionPkg
+	t.Cleanup(func() {
+		encodeSessionPkg = origEncode
+	})
+	ctxEnc, cancelEnc := context.WithCancel(WithSession(context.Background(), pipeSess))
+	encodeSessionPkg = func(session getty.Session, msg message.RpcMessage) ([]byte, error) {
+		pkgBytes, encErr := origEncode(session, msg)
+		cancelEnc()
+		return pkgBytes, encErr
+	}
+	_, encCancelErr := client.SendSyncRequestInContext(ctxEnc, req)
+	require.ErrorIs(t, encCancelErr, context.Canceled)
+	assert.False(t, pipeSess.IsClosed(), "CompressEncoding=true pre-write cancel during encode must NOT close shared session")
+	encodeSessionPkg = origEncode
+
+	ctxCompPost, cancelCompPost := context.WithCancel(WithSession(context.Background(), pipeSess))
+	defer cancelCompPost()
+	compFrameRead := make(chan int, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		n, readErr := serverConn.Read(buf)
+		if readErr == nil && n > 0 {
+			compFrameRead <- n
+			cancelCompPost()
+		}
+	}()
+	_, compPostErr := client.SendSyncRequestInContext(ctxCompPost, req)
+	require.ErrorIs(t, compPostErr, context.Canceled)
+	assert.Greater(t, <-compFrameRead, 0)
+	assert.False(t, pipeSess.IsClosed(), "CompressEncoding=true post-write cancel must NOT close shared session")
 }
 
 func TestSessionWriterFailureCleanupUsesLockedConnWithoutRacingOnCloseGC(t *testing.T) {
