@@ -50,6 +50,7 @@ replace seata.apache.org/seata-go/v2 => github.com/MoeGolibrary/seata-go/v2 <版
 | 2 | 多 TC 下的会话注册与二阶段回包：每条会话就绪前在自身连接上注册 TM、在每条就绪会话上注册 RM 资源，且二阶段回包原路写回收到请求的会话 | 已完成 | 待提交 | PR #3 (`49fd2f6`) |
 | 3 | TC 重启主动关闭连接（EOF）后 `dubbo-getty` 不重连；某个服务地址无活跃会话时按指数退避（300ms～10s）重建客户端连接 | 已完成 | 待提交 | PR #4 (`c722143`) |
 | 4 | 暴露 `SessionOpenHook` 与非阻塞 `ReadySessions()`，并在 Getty 传输层按会话统一串行化 TM/RM/心跳写入、传递调用方 `ctx` 截止时间并与 `OnClose` 连接回收生命周期对齐 | 已完成 | 待提交 | PR #5 (`9f2fe9c`) / PR #6 (`07dfe4c`) |
+| 5 | 启动 TC 连接前完成消息处理器和 RM 会话回调注册，并同步 Getty 和 gRPC 的处理器注册与分发 | 已完成 | 待提交 | PR #8 (`fb5de9b`) |
 
 ## 发版流程
 
