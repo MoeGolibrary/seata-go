@@ -156,10 +156,11 @@ func TestE2E_SyncRequestResponseFuture(t *testing.T) {
 
 	// Register typeMap so StartReceiveLoop can route the response to the processor.
 	handler := GetGrpcClientHandlerInstance()
-	handler.typeMap["GlobalBeginResponseProto"] = message.MessageTypeGlobalBeginResult
-	handler.processorMap[message.MessageTypeGlobalBeginResult] = &testResponseProcessor{
+	responseProcessor := &testResponseProcessor{
 		remoting: GetGrpcRemotingClient().grpcRemoting,
 	}
+	handler.RegisterType("GlobalBeginResponseProto", message.MessageTypeGlobalBeginResult)
+	handler.RegisterProcessor(message.MessageTypeGlobalBeginResult, responseProcessor)
 
 	ch := newTestChannel(t, addr)
 
@@ -178,6 +179,10 @@ func TestE2E_SyncRequestResponseFuture(t *testing.T) {
 	proto, err := Encode(reqMsg)
 	require.NoError(t, err)
 	require.NoError(t, ch.Send(proto))
+
+	// Re-register while the response can arrive on the receive loop.
+	handler.RegisterType("GlobalBeginResponseProto", message.MessageTypeGlobalBeginResult)
+	handler.RegisterProcessor(message.MessageTypeGlobalBeginResult, responseProcessor)
 
 	select {
 	case <-future.Done:

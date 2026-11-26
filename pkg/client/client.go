@@ -77,22 +77,22 @@ func initTmClient(cfg *Config) {
 	})
 }
 
-// initRemoting init remoting
-func initRemoting(cfg *Config) {
-	seataConfig := remoteConfig.SeataConfig{
+func initRemotingConfig(cfg *Config) {
+	remoteConfig.InitTransportConfig(&cfg.TransportConfig)
+	remoteConfig.InitSeataConfig(&remoteConfig.SeataConfig{
 		ApplicationID:        cfg.ApplicationID,
 		TxServiceGroup:       cfg.TxServiceGroup,
 		ServiceVgroupMapping: cfg.ServiceConfig.VgroupMapping,
 		ServiceGrouplist:     cfg.ServiceConfig.Grouplist,
-	}
+	})
+}
 
-	remoteConfig.InitTransportConfig(&cfg.TransportConfig)
-	remoteConfig.InitSeataConfig(&seataConfig)
+func initRemoting(cfg *Config) {
 	switch protocol.Protocol(remoteConfig.GetTransportConfig().Protocol) {
 	case protocol.ProtocolGRPC:
 		grpc.InitGrpc(&cfg.RemotingConfig)
 	default:
-		getty.InitGetty(&cfg.RemotingConfig, &seataConfig)
+		getty.InitGetty(&cfg.RemotingConfig, remoteConfig.GetSeataConfig())
 	}
 }
 
@@ -101,7 +101,7 @@ func initRmClient(cfg *Config) {
 	onceInitRmClient.Do(func() {
 		log.Init()
 		loadbalance.InitLoadBalanceConfig(cfg.ClientConfig.LoadBalanceConfig)
-		initRemoting(cfg)
+		initRemotingConfig(cfg)
 		rm.InitRm(rm.RmConfig{
 			Config:         cfg.ClientConfig.RmConfig,
 			ApplicationID:  cfg.ApplicationID,
@@ -121,6 +121,9 @@ func initRmClient(cfg *Config) {
 		saga.InitSaga()
 		at.InitAT(cfg.ClientConfig.UndoConfig, cfg.AsyncWorkerConfig)
 		at.InitXA(cfg.ClientConfig.XaConfig)
+
+		// A TC can respond to the first registration as soon as the connection opens.
+		initRemoting(cfg)
 	})
 }
 

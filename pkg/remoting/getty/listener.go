@@ -40,6 +40,7 @@ var (
 
 type gettyClientHandler struct {
 	idGenerator  *atomic.Uint32
+	processorMu  sync.RWMutex
 	processorMap map[message.MessageType]processor.RemotingProcessor
 }
 
@@ -133,11 +134,14 @@ func (g *gettyClientHandler) OnMessage(session getty.Session, pkg interface{}) {
 	}
 
 	if mm, ok := rpcMessage.Body.(message.MessageTypeAware); ok {
-		processor := g.processorMap[mm.GetTypeCode()]
+		msgType := mm.GetTypeCode()
+		g.processorMu.RLock()
+		processor := g.processorMap[msgType]
+		g.processorMu.RUnlock()
 		if processor != nil {
 			processor.Process(ctx, rpcMessage)
 		} else {
-			log.Errorf("This message type %v has no processor.", mm.GetTypeCode())
+			log.Errorf("This message type %v has no processor.", msgType)
 		}
 	} else {
 		log.Errorf("This rpcMessage body %#v is not MessageTypeAware type.", rpcMessage.Body)
@@ -180,6 +184,8 @@ func (g *gettyClientHandler) transferHeartBeat(session getty.Session, msg messag
 
 func (g *gettyClientHandler) RegisterProcessor(msgType message.MessageType, processor processor.RemotingProcessor) {
 	if nil != processor {
+		g.processorMu.Lock()
 		g.processorMap[msgType] = processor
+		g.processorMu.Unlock()
 	}
 }
