@@ -40,20 +40,19 @@ var (
 
 type grpcClientHandler struct {
 	idGenerator  *atomic.Uint32
+	processorMu  sync.RWMutex
 	processorMap map[message.MessageType]processor.RemotingProcessor
 	typeMap      map[string]message.MessageType
 }
 
 func GetGrpcClientHandlerInstance() *grpcClientHandler {
-	if clientHandler == nil {
-		onceClientHandler.Do(func() {
-			clientHandler = &grpcClientHandler{
-				idGenerator:  &atomic.Uint32{},
-				processorMap: make(map[message.MessageType]processor.RemotingProcessor, 0),
-				typeMap:      make(map[string]message.MessageType, 0),
-			}
-		})
-	}
+	onceClientHandler.Do(func() {
+		clientHandler = &grpcClientHandler{
+			idGenerator:  &atomic.Uint32{},
+			processorMap: make(map[message.MessageType]processor.RemotingProcessor, 0),
+			typeMap:      make(map[string]message.MessageType, 0),
+		}
+	})
 	return clientHandler
 }
 
@@ -147,15 +146,19 @@ func (g *grpcClientHandler) StartReceiveLoop(ctx context.Context, c *Channel) {
 				}
 
 				body := rpcMessage.Body.(proto.Message)
-				if t, ok := g.typeMap[string(proto.MessageName(body).Name())]; ok {
-					processor := g.processorMap[t]
-					if processor != nil {
-						processor.Process(ctx, rpcMessage)
-					} else {
-						log.Errorf("This format type %v has no processor.", t)
-					}
-				} else {
+				name := string(proto.MessageName(body).Name())
+				g.processorMu.RLock()
+				msgType, ok := g.typeMap[name]
+				processor := g.processorMap[msgType]
+				g.processorMu.RUnlock()
+
+				switch {
+				case !ok:
 					log.Errorf("This rpcMessage body %#v is not in typeMap.", body)
+				case processor == nil:
+					log.Errorf("This format type %v has no processor.", msgType)
+				default:
+					processor.Process(ctx, rpcMessage)
 				}
 			}()
 		}
@@ -176,12 +179,16 @@ func (g *grpcClientHandler) transferHeartBeat(channel *Channel, msg *pb.Heartbea
 
 func (g *grpcClientHandler) RegisterProcessor(msgType message.MessageType, processor processor.RemotingProcessor) {
 	if nil != processor {
+		g.processorMu.Lock()
 		g.processorMap[msgType] = processor
+		g.processorMu.Unlock()
 	}
 }
 
 func (g *grpcClientHandler) RegisterType(messageProto string, msgType message.MessageType) {
 	if messageProto != "" {
+		g.processorMu.Lock()
 		g.typeMap[messageProto] = msgType
+		g.processorMu.Unlock()
 	}
 }
